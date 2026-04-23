@@ -5,12 +5,11 @@ ABO-aware StorageManager subclass.
 Overrides ``_create_l1_manager`` to return ABOL1Manager,
 and adds all ABO-specific behaviour: compress/decompress managers,
 staging pool, and hooks into reserve_write / submit_prefetch_task /
-read_prefetched_results / close.
+_on_prefetch_l1_hits / close.
 """
 
 # Standard
-from contextlib import contextmanager
-from typing import Iterator
+from typing import Literal
 import threading
 
 # Third Party
@@ -204,10 +203,10 @@ class ABOStorageManager(StorageManager):
             logger.info("Created ABO release_stream for async staging release")
         return self._release_stream, self._cupy_release_stream
 
-    def schedule_staging_release(
+    def submit_release_tasks(
         self,
         h2d_event: torch.cuda.Event,
-        memory_obj: CompressedMemoryObj,
+        memory_objs: list[MemoryObj],
     ) -> None:
         """Schedule async staging release after H2D completes.
 
@@ -221,9 +220,14 @@ class ABOStorageManager(StorageManager):
         """
         release_stream, cupy_release_stream = self._get_release_stream()
 
-        with torch.cuda.device(release_stream.device):
+        if h2d_event is not None:
             release_stream.wait_event(h2d_event)
-            cupy_release_stream.launch_host_func(memory_obj.release_staging, None)
+
+        with torch.cuda.device(release_stream.device):
+            for memory_obj in memory_objs:
+                if not isinstance(memory_obj, CompressedMemoryObj):
+                    continue
+                cupy_release_stream.launch_host_func(memory_obj.release_staging, 0)
 
     @property
     def abo_compress_manager(self) -> ABOCompressManager:
@@ -235,36 +239,77 @@ class ABOStorageManager(StorageManager):
 
     # --- Overridden methods ---
 
+    def reserve_write(
+        self,
+        keys: list[ObjectKey],
+        layout_desc: MemoryLayoutDesc,
+        mode: Literal["new", "update", "all"],
+    ) -> dict[ObjectKey, MemoryObj]:
+        """Override: after base reserve_write allocates CompressedMemoryObj,
+        eagerly acquire a staging buffer (num_readers=1) for each STORE-path
+        obj. If the pool is exhausted for a key, abort that write and drop
+        it from the returned dict so the caller will skip D2H for it.
+
+        Keeping staging acquisition here (instead of in ABOMemoryManager.
+        allocate) avoids leaking the STORE/L2-load distinction into the L1
+        layer: L2->L1 loads go through a different path and never pass
+        through this reserve_write.
+        """
+        result = super().reserve_write(keys, layout_desc, mode)
+
+        failed_keys: list[ObjectKey] = []
+        for k, obj in list(result.items()):
+            if not isinstance(obj, CompressedMemoryObj):
+                continue
+
+            if not obj.try_acquire_staging():
+                failed_keys.append(k)
+                result.pop(k)
+
+        if failed_keys:
+            logger.warning(
+                "StagingPool exhausted for %d keys; aborting their writes",
+                len(failed_keys),
+            )
+            self._l1_manager.abort_write(failed_keys)  # type: ignore[attr-defined]
+
+        return result
+
     def _on_prefetch_l1_hits(
         self,
         l1_read_result: dict[ObjectKey, tuple[L1Error, MemoryObj | None]],
         l1_hit_keys: list[ObjectKey],
         extra_count: int = 0,
-    ) -> None:
+    ) -> list[ObjectKey]:
         """Override: trigger early decompress for L1-hit objects."""
-        l1_hit_objs: list[MemoryObj] = []
-        for k in l1_hit_keys:
-            if k in l1_read_result:
-                obj = l1_read_result[k][1]
-                if obj is not None:
-                    l1_hit_objs.append(obj)
-        if l1_hit_objs:
-            self._abo_decompress_manager.prepare_decompress_batch(
-                l1_hit_objs, is_retrieve=False, num_readers=extra_count + 1
-            )
+        skipped: list[ObjectKey] = []
+        to_decompress: list[CompressedMemoryObj] = []
+        for i, k in enumerate(l1_hit_keys):
+            entry = l1_read_result.get(k)
+            obj = entry[1] if entry is not None else None
+            if not isinstance(obj, CompressedMemoryObj):
+                continue
 
-    @contextmanager
-    def read_prefetched_results(
+            if obj.has_staging:
+                # Reuse STORE-in-progress staging: no decompress needed
+                obj.staging_ref_acquire(extra_count)
+                continue
+
+            if not obj.try_acquire_staging(extra_count=extra_count):
+                skipped = list(l1_hit_keys[i:])
+                break
+            to_decompress.append(obj)
+
+        self._abo_decompress_manager.submit_decompress_tasks(to_decompress)  # type: ignore[arg-type]
+
+        return skipped
+
+    def release_prefetch_staging(
         self,
         keys: list[ObjectKey],
-    ) -> Iterator[list[MemoryObj] | None]:
-        """Override: wrap base read_prefetched_results with ABO decompress."""
-        with super().read_prefetched_results(keys) as objs:
-            if objs is not None:
-                self._abo_decompress_manager.prepare_decompress_batch(
-                    objs, is_retrieve=True, num_readers=0
-                )
-            yield objs
+        extra_count: int = 0,
+    ) -> None:
+        self._l1_manager.release_prefetch_staging(keys, extra_count=extra_count)  # type: ignore[attr-defined]
 
     def close(self) -> None:
         """Override: close ABO managers before base close."""

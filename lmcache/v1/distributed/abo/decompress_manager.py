@@ -3,7 +3,7 @@
 """
 ABO decompress manager (CUDA stream + launch_host_func mode).
 
-Manages async decompression in the RETRIEVE path:
+Manages async decompression in the PREFETCH path:
 1. Batch-submit decompress tasks via cupy launch_host_func on _decompress_stream
 2. Each decompress callback runs sync decompress (codec.decompress with numpy buffers)
 3. After decompress, record event for GPU-side sync (current_stream.wait_event)
@@ -64,10 +64,6 @@ class ABODecompressManager:
         """
         self._codec = codec
 
-        # Cached num_readers from prefetch path, used when retrieve
-        # path needs to acquire staging (has_staging=False fallback)
-        self._num_readers: int = 1
-
         # Lazily created CUDA stream + cupy wrapper
         self._decompress_stream: Optional[torch.cuda.Stream] = None
         self._cupy_decompress_stream: Optional[cupy.cuda.ExternalStream] = None
@@ -85,67 +81,22 @@ class ABODecompressManager:
             )
         return self._decompress_stream, self._cupy_decompress_stream
 
-    def prepare_decompress_batch(
+    def submit_decompress_tasks(
         self,
         memory_objs: list["MemoryObj"],
-        is_retrieve: bool = False,
-        num_readers: int = 1,
     ) -> None:
         """Batch-submit async decompress tasks for a list of MemoryObj.
 
-        For CompressedMemoryObj without staging buffer (data in raw_data),
-        acquire staging buffer, submit sync decompress via launch_host_func
-        on _decompress_stream, record decompress_event.
-
-        For non-compressed MemoryObj or those already having staging, do nothing.
-
-        Args:
-            memory_objs: MemoryObj list from read_prefetched_results.
-            is_retrieve: If True, this is the retrieve (final) path;
-                acquire failure marks decompress_failed on the obj.
-                If False, this is the prefetch (early) path;
-                acquire failure silently skips the obj.
-            num_readers: Number of ref counts to add when acquiring
-                or bumping staging ref. For prefetch path this should
-                be tp_size (1 + extra_count); for retrieve path this
-                should be 0 (prefetch already holds the refs).
-                Note: when retrieve path hits has_staging=False (prefetch
-                didn't acquire staging in time), try_acquire_staging uses
-                the cached _num_readers from the last prefetch call.
+        Used by the prefetch path. The caller (e.g.
+        ``ABOStorageManager._on_prefetch_l1_hits``) is responsible for
+        acquiring a fresh staging buffer for each obj before passing it
+        here; objs that already hold staging (STORE compress-in-progress,
+        reuse case) MUST be filtered out by the caller.
         """
         decompress_stream, cupy_decompress_stream = self._get_decompress_stream()
 
-        # Prefetch path: cache num_readers for later retrieve fallback
-        if not is_retrieve:
-            self._num_readers = num_readers
-
         for obj in memory_objs:
             if not isinstance(obj, CompressedMemoryObj):
-                continue
-
-            # Already has staging (data still in staging, no decompress needed)
-            # add 0 for retrieve path, extra_count+1 for prefetch path
-            if obj.has_staging:
-                obj.staging_ref_acquire(num_readers)
-                continue
-
-            # Acquire staging buffer via obj's class-level pool
-            if not obj.try_acquire_staging(num_readers=self._num_readers):
-                if is_retrieve:
-                    logger.warning(
-                        "StagingPool exhausted during retrieve, "
-                        "fallback and mark decompress failed for obj id=%s",
-                        id(obj),
-                    )
-                    # Mark decompress as failed so .tensor returns None,
-                    # triggering error in H2D -> retrieve failure path
-                    obj.mark_decompress_failed()
-                    continue
-                else:
-                    logger.warning(
-                        "StagingPool has no free buffer, "
-                        "delayed decompress to retrieve stage"
-                    )
                 continue
 
             # Capture references for the closure
@@ -160,6 +111,8 @@ class ABODecompressManager:
                 Args:
                     _arg: User data from cupy launch_host_func (unused).
                 """
+                if not _o.has_staging:
+                    return
                 try:
                     # codec.decompress(dst_np, dst_size, src_np, src_size)
                     # Pass full raw_data; codec self-describes block boundaries

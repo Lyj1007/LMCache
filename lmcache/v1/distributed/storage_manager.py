@@ -327,7 +327,9 @@ class StorageManager:
         # NOTE: For L1, there will be cases that "object in the middle" is not found.
         # In this case, we need to `finish_read` for the latter objects so that
         # there won't be dangling read locks.
-        skipped_keys = []
+        skipped_keys = self._on_prefetch_l1_hits(
+            l1_read_result, keys[:hit_count], extra_count=extra_count
+        )
         for key in keys[hit_count:]:
             if key in l1_read_result and l1_read_result[key][1] is not None:
                 # this key is actually reserved, need to release the read lock
@@ -345,11 +347,6 @@ class StorageManager:
                 },
             )
         )
-
-        if hit_count > 0:
-            self._on_prefetch_l1_hits(
-                l1_read_result, keys[:hit_count], extra_count=extra_count
-            )
 
         # Submit remaining keys to L2 prefetch controller
         remaining_keys = keys[hit_count:]
@@ -572,9 +569,10 @@ class StorageManager:
         l1_read_result: dict[ObjectKey, tuple[L1Error, MemoryObj | None]],
         l1_hit_keys: list[ObjectKey],
         extra_count: int = 0,
-    ) -> None:
+    ) -> list[ObjectKey]:
         """Hook called when L1 prefix hits are found during prefetch.
         Subclasses may override (e.g. ABO early decompress)."""
+        return []
 
     # Functions for debugging and testing
     def memcheck(self) -> bool:

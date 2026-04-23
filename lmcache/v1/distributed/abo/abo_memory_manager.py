@@ -48,21 +48,13 @@ class ABOMemoryManager(L1MemoryManager):
         self,
         layout_desc: MemoryLayoutDesc,
         count: int,
-        need_compresses: list[bool] | None = None,
     ) -> tuple[L1Error, list[MemoryObj]]:
         """Allocate compressed MemoryObj (ABO mode).
 
-        Allocates compressed-size L1 space and wraps as CompressedMemoryObj.
-        Staging buffer is lazy-acquired in the .tensor getter.
-
-        Args:
-            layout_desc: Layout description of the original (uncompressed) data.
-            count: Number of objects to allocate.
-            need_compresses: Per-object flag. True for STORE path (GPU->CPU),
-                False for L2->L1 load path. Defaults to all False.
-
-        Returns:
-            tuple[L1Error, list[MemoryObj]]: Error code and allocated objects.
+        Only allocates compressed-size L1 raw_data and wraps as
+        CompressedMemoryObj. Staging buffer acquisition is the caller's
+        responsibility (e.g. ABOStorageManager.reserve_write for STORE,
+        _on_prefetch_l1_hits for RETRIEVE); this method is path-agnostic.
         """
         ratio = self._abo_config.ratio
         compressed_bytes = estimate_compressed_bytes(
@@ -83,21 +75,17 @@ class ABOMemoryManager(L1MemoryManager):
         if raw_objects is None:
             return L1Error.OUT_OF_MEMORY, []
 
-        if need_compresses is None:
-            need_compresses = [False] * count
-
         # Wrap as CompressedMemoryObj
         compressed_objs: list[MemoryObj] = []
-        for raw_obj, need_compress in zip(raw_objects, need_compresses, strict=True):
+        for raw_obj in raw_objects:
             compressed_obj = CompressedMemoryObj(
                 raw_data=raw_obj.raw_data,
                 metadata=raw_obj.meta,
                 parent_allocator=raw_obj.parent_allocator,  # type: ignore[attr-defined]  # noqa: E501,F821
-                staging_tensor=None,  # lazy allocation
+                staging_tensor=None,
                 original_shapes=layout_desc.shapes,
                 original_dtypes=layout_desc.dtypes,
             )
-            compressed_obj._need_compress = need_compress
             compressed_obj.meta.shape = layout_desc.shapes[0]
             compressed_obj.meta.dtype = layout_desc.dtypes[0]
             compressed_obj.meta.shapes = layout_desc.shapes

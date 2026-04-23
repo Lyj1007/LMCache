@@ -106,10 +106,10 @@ class CompressedMemoryObj(TensorMemoryObj):
         self._original_dtypes: list[torch.dtype] = original_dtypes
 
         # Compress state (STORE path)
-        self._need_compress: bool = False
         self._compress_failed: bool = (
             False  # True if compress failed (graceful degradation)
         )
+        self._compress_event: Optional[torch.cuda.Event] = None
 
         # Decompress state (RETRIEVE path)
         self._need_decompress: bool = False
@@ -169,13 +169,12 @@ class CompressedMemoryObj(TensorMemoryObj):
         return super().get_size()
 
     def _resolve_effective_buffer(self) -> Optional[torch.Tensor]:
-        """Resolve the effective host buffer with validation, lazy-acquire and sync.
+        """Resolve the effective host buffer with validation and decompress sync.
 
         Shared logic for .raw_tensor / .tensor / .data_ptr:
         1. Invalid / failed → None
-        2. Lazy staging acquire if needed (STORE path)
-        3. Wait decompress event on staging (RETRIEVE path)
-        4. Return staging tensor or raw_data
+        2. Wait decompress event on staging (RETRIEVE path)
+        3. Return staging tensor or raw_data
         """
         if not self.valid:
             logger.warning("Trying to access an invalidated CompressedMemoryObj")
@@ -183,16 +182,6 @@ class CompressedMemoryObj(TensorMemoryObj):
 
         if self._compress_failed or self._decompress_failed:
             return None
-
-        # Lazy staging allocation (STORE path)
-        if self._need_compress and self._staging_tensor is None:
-            if not self.try_acquire_staging():
-                logger.error(
-                    "StagingPool exhausted, cannot lazy acquire staging buffer "
-                    "(address=%d)",
-                    self.meta.address,
-                )
-                return None
 
         if self._staging_tensor is not None:
             # Wait for decompress event (idempotent, multi-device safe).
@@ -242,10 +231,10 @@ class CompressedMemoryObj(TensorMemoryObj):
 
         Compression-aware behaviour:
         - If _compress_failed=True: return None (graceful degradation)
-        - If compression is still in progress (_need_compress=True),
-          wait for compress_event to complete. This blocks the caller
-          (StoreController's background thread) until compressed data
-          is ready in raw_data, without blocking the main thread.
+        - If a compress task has been submitted (_compress_event is set) and
+          has not failed, wait for compress_event to complete. This blocks
+          the caller (StoreController's background thread) until compressed
+          data is ready in raw_data, without blocking the main thread.
         - Returns memoryview of full raw_data (fixed size buffer).
           The codec embeds block metadata so the decompressor
           self-describes boundaries; no need to trim to actual
@@ -256,7 +245,7 @@ class CompressedMemoryObj(TensorMemoryObj):
             return None
 
         # Compression still in progress: wait for it to complete
-        if self._need_compress and hasattr(self, "_compress_event"):
+        if self._compress_event is not None:
             self._compress_event.synchronize()
 
         return super().byte_array
@@ -269,19 +258,13 @@ class CompressedMemoryObj(TensorMemoryObj):
         """
         self._compress_event = event
 
-    def mark_compress_done(self):
-        """Mark compress as done."""
-        self._need_compress = False
-
     def mark_compress_failed(self):
         """Mark compress as failed (graceful degradation).
 
-        Resets compress state so that the object is not stuck in
-        _need_compress=True forever. The object will not have valid
-        compressed data, so L2 store should skip it.
-        Sets _compress_failed=True so that .tensor returns None.
+        The object will not have valid compressed data, so L2 store
+        should skip it. Sets _compress_failed=True so that .tensor
+        returns None.
         """
-        self._need_compress = False
         self._compress_failed = True
 
     def mark_decompress_failed(self):
@@ -294,7 +277,7 @@ class CompressedMemoryObj(TensorMemoryObj):
         self._decompress_failed = True
         self._decompress_event = None
 
-    def try_acquire_staging(self, num_readers: int = 1) -> bool:
+    def try_acquire_staging(self, extra_count: int = 0) -> bool:
         """Acquire a staging buffer from the class-level StagingPool.
 
         On success, sets self._staging_tensor and calls
@@ -303,7 +286,7 @@ class CompressedMemoryObj(TensorMemoryObj):
         Thread-safe: protected by _staging_lock.
 
         Args:
-            num_readers: Number of ref counts to add (default 1).
+            extra_count: Extra number of ref counts to add (default 0).
                 For prefetch/retrieve paths, pass tp_size so that
                 each TP worker can independently release_staging.
 
@@ -317,13 +300,13 @@ class CompressedMemoryObj(TensorMemoryObj):
         with self._staging_lock:
             # Double-check: another thread may have acquired staging already
             if self._staging_tensor is not None:
-                self._staging_ref_count += num_readers
+                self._staging_ref_count += 1 + extra_count
                 return True
             staging = pool.try_acquire()
             if staging is None:
                 return False
             self._staging_tensor = staging
-            self._staging_ref_count += num_readers
+            self._staging_ref_count += 1 + extra_count
             self._setup_staging_memcpy_meta()
             return True
 
@@ -353,7 +336,7 @@ class CompressedMemoryObj(TensorMemoryObj):
         self._need_decompress = False
         self._decompress_event = None
 
-    def staging_ref_acquire(self, num_readers: int = 1):
+    def staging_ref_acquire(self, extra_count: int = 0):
         """Increment staging ref count (for reusing existing staging).
 
         Called when RETRIEVE path skips decompress because staging
@@ -362,10 +345,10 @@ class CompressedMemoryObj(TensorMemoryObj):
         Thread-safe: protected by _staging_lock.
 
         Args:
-            num_readers: Number of ref counts to add (default 1).
+            extra_count: Number of ref counts to add (default 0).
         """
         with self._staging_lock:
-            self._staging_ref_count += num_readers
+            self._staging_ref_count += 1 + extra_count
 
     def mark_staging_released(self):
         """Mark staging buffer as released.
@@ -385,7 +368,7 @@ class CompressedMemoryObj(TensorMemoryObj):
         self._h2d_event = None
         return staging
 
-    def release_staging(self, _arg=None):
+    def release_staging(self, extra_count: int = 0):
         """Decrement staging ref count and release when it reaches 0.
 
         Each acquire / staging_ref_acquire increments the count;
@@ -397,15 +380,14 @@ class CompressedMemoryObj(TensorMemoryObj):
         Thread-safe: protected by _staging_lock.
 
         Args:
-            _arg: Unused. Accepts the extra argument passed by
-                cupy.cuda.ExternalStream.launch_host_func(callback, arg).
+            extra_count: Number of ref counts to subtract (default 0).
         """
         staging_to_release = None
         with self._staging_lock:
             if self._staging_tensor is None:
                 return
 
-            self._staging_ref_count -= 1
+            self._staging_ref_count -= 1 + extra_count
             if self._staging_ref_count > 0:
                 return
 
@@ -441,7 +423,6 @@ class CompressedMemoryObj(TensorMemoryObj):
             f"original_shapes={self._original_shapes}, "
             f"original_dtypes={self._original_dtypes}, "
             f"has_staging={self.has_staging}, "
-            f"need_compress={self._need_compress}, "
             f"compress_failed={self._compress_failed}, "
             f"need_decompress={self._need_decompress}, "
             f"decompress_failed={self._decompress_failed})"

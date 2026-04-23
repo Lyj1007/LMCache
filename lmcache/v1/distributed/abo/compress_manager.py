@@ -208,13 +208,6 @@ class ABOCompressManager:
                             pass
                     return
 
-                # Mark compress done.
-                # NOTE: Do NOT call _restore_raw_data_meta() here.
-                # meta.address restoration is handled by mark_staging_released()
-                # when ref_count reaches 0. Restoring it here would break
-                # concurrent RETRIEVE H2D that still uses staging with address=0.
-                _compressed_obj.mark_compress_done()
-
                 logger.debug(
                     "Compress done: key=%s, actual_compressed_size=%d bytes, "
                     "buffer_size=%d bytes",

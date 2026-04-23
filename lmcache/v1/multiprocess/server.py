@@ -16,6 +16,7 @@ import zmq
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.distributed.abo.abo_storage_manager import ABOStorageManager
+from lmcache.v1.distributed.abo.compressed_memory_obj import CompressedMemoryObj
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
@@ -407,9 +408,6 @@ class MPCacheEngine:
                         gpu_context.gpu_kv_format_,
                         0,
                     )
-                # ABO: mark as needing compress before D2H (STORE path only)
-                if self._abo_enabled:
-                    memory_obj._need_compress = True  # type: ignore[attr-defined]  # noqa: E501,F821
 
                 # Store is not batched, so we always use chunk_idx=0 (single slot)
                 lmcache_memcpy_async_d2h(
@@ -417,7 +415,7 @@ class MPCacheEngine:
                 )
 
                 # ABO: per-chunk event + async compress trigger
-                if self._abo_enabled:
+                if self._abo_enabled and isinstance(memory_obj, CompressedMemoryObj):
                     d2h_event = torch.cuda.Event()
                     d2h_event.record()
                     self.storage_manager.abo_compress_manager.submit_per_chunk_compress(  # type: ignore[attr-defined]  # noqa: E501,F821
@@ -537,6 +535,10 @@ class MPCacheEngine:
                 effective_start = max(chunk_start, skip_first_n_tokens)
                 if effective_start >= chunk_end:
                     # Entire batch is within APC range, skip it
+                    if self._abo_enabled:
+                        self.storage_manager.submit_release_tasks(  # type: ignore[attr-defined]
+                            None, memory_obj_batch
+                        )
                     continue
 
                 skip_tokens_in_chunk = max(
@@ -563,40 +565,22 @@ class MPCacheEngine:
                     start_chunk_id * blocks_per_chunk : end_chunk_id * blocks_per_chunk
                 ]
 
-                # Copy from CPU to GPU tmp buffers, then scatter to paged KV — per group
-                # H2D copy: each memory_obj maps to its own batch slot
-                if self._abo_enabled:
-                    # ABO path: try/except/finally to guarantee staging release
-                    # release_staging is scheduled on a separate release_stream
-                    # via event sync to avoid blocking H2D stream
-                    _h2d_error: Exception | None = None
-                    for chunk_idx, memory_obj in enumerate(memory_obj_batch):
-                        try:
-                            if _h2d_error is not None:
-                                continue
-                            lmcache_memcpy_async_h2d(
-                                memory_obj,
-                                gpu_context.get_tmp_gpu_buffer_flat(
-                                    chunk_idx=chunk_idx
-                                ),
-                            )
-                        except Exception as e:
-                            if _h2d_error is None:
-                                _h2d_error = e
-                        finally:
-                            # Record event on H2D stream
-                            h2d_event = torch.cuda.Event()
-                            h2d_event.record()
-                            self.storage_manager.schedule_staging_release(  # type: ignore[attr-defined]  # noqa: E501,F821
-                                h2d_event, memory_obj
-                            )
-                    if _h2d_error is not None:
-                        raise _h2d_error
-                else:
+                try:
                     for chunk_idx, memory_obj in enumerate(memory_obj_batch):
                         lmcache_memcpy_async_h2d(
                             memory_obj,
                             gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=chunk_idx),
+                        )
+                except Exception as e:
+                    raise e
+                finally:
+                    if self._abo_enabled:
+                        # Record a single event on H2D stream for the whole
+                        # batch, then schedule staging release for each obj.
+                        h2d_event = torch.cuda.Event()
+                        h2d_event.record()
+                        self.storage_manager.submit_release_tasks(  # type: ignore[attr-defined]
+                            h2d_event, memory_obj_batch
                         )
 
                 for group_idx in range(num_groups):
@@ -1044,6 +1028,11 @@ class MPCacheEngine:
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
         extra_count = compute_extra_count(tp_size, key.world_size)
+
+        if self._abo_enabled:
+            self.storage_manager.release_prefetch_staging(  # type: ignore[attr-defined]
+                obj_keys, extra_count=extra_count
+            )
 
         self.storage_manager.finish_read_prefetched(obj_keys, extra_count=extra_count)
 

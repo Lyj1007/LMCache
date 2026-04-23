@@ -10,6 +10,7 @@ and adds ``abort_write`` for compress failure recovery.
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.abo.abo_codec import ABOConfig
 from lmcache.v1.distributed.abo.abo_memory_manager import ABOMemoryManager
+from lmcache.v1.distributed.abo.compressed_memory_obj import CompressedMemoryObj
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig
 from lmcache.v1.distributed.error import L1Error
@@ -34,6 +35,20 @@ class ABOL1Manager(L1Manager):
     def _create_memory_manager(self, config: L1ManagerConfig) -> L1MemoryManager:
         """Override: create ABOMemoryManager with codec config."""
         return ABOMemoryManager(config.memory_config, abo_config=self._abo_config)
+
+    def release_prefetch_staging(
+        self,
+        keys: list[ObjectKey],
+        extra_count: int = 0,
+    ) -> None:
+        with self._lock:
+            for k in keys:
+                entry = self._objects.get(k)
+                if entry is None:
+                    continue
+                obj = entry.memory_obj
+                if isinstance(obj, CompressedMemoryObj) and obj.has_staging:
+                    obj.release_staging(extra_count)
 
     @l1_mgr_synchronized
     def abort_write(
