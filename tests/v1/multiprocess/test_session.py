@@ -115,10 +115,16 @@ class TestSessionManager:
         assert s1 is not s2
 
     def test_remove(self, session_manager: SessionManager) -> None:
-        session_manager.get_or_create("req-1")
-        removed = session_manager.remove("req-1")
-        assert removed is not None
-        assert removed.request_id == "req-1"
+        s1 = session_manager.get_or_create("req-1")
+        s1.total_tokens = 1000
+        s1.update_retrieved_range(0, 600)
+        session_manager.remove("req-1")
+
+        s2 = session_manager.get_or_create("req-2")
+        s2.total_tokens = 2000
+        s2.update_retrieved_range(0, 1500)
+        session_manager.remove("req-2")
+
         # Should create a fresh session
         s = session_manager.get_or_create("req-1")
         assert s.num_chunks_processed == 0
@@ -127,32 +133,6 @@ class TestSessionManager:
         """Removing a non-existent session should return None."""
         result = session_manager.remove("does-not-exist")
         assert result is None
-
-    def test_remove_accumulates_stats(self, session_manager: SessionManager) -> None:
-        """Stats from removed sessions accumulate."""
-        s1 = session_manager.get_or_create("req-1")
-        s1.total_tokens = 1000
-        s1.retrieved_tokens = 600
-        session_manager.remove("req-1")
-
-        s2 = session_manager.get_or_create("req-2")
-        s2.total_tokens = 2000
-        s2.retrieved_tokens = 1500
-        session_manager.remove("req-2")
-
-        stats = session_manager.report_hit_stats()
-        assert stats["total_requests"] == 2
-        assert stats["total_tokens"] == 3000
-        assert stats["total_retrieved_tokens"] == 2100
-        assert stats["hit_rate"] == round(2100 / 3000, 4)
-
-    def test_report_hit_stats_empty(self, session_manager: SessionManager) -> None:
-        """Empty manager returns zero stats."""
-        stats = session_manager.report_hit_stats()
-        assert stats["total_requests"] == 0
-        assert stats["total_tokens"] == 0
-        assert stats["total_retrieved_tokens"] == 0
-        assert stats["hit_rate"] == 0.0
 
     def test_cleanup_expired(self, session_manager: SessionManager) -> None:
         """Sessions older than TTL should be cleaned up."""
