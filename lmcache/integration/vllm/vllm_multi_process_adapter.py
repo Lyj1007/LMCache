@@ -212,7 +212,7 @@ LookupResult = int
 class LMCacheMPSchedulerAdapter:
     def __init__(
         self,
-        server_url: str,
+        server_urls: list[str],
         context: zmq.Context,
         model_name: str,
         vllm_block_size: int,
@@ -232,43 +232,82 @@ class LMCacheMPSchedulerAdapter:
             mq_timeout: Timeout in seconds for message queue requests.
             heartbeat_interval: Interval in seconds between heartbeat pings.
         """
-        self.mq_client = MessageQueueClient(server_url, context)
+        assert len(server_urls) >= 1, "At least one server url required"
+        self._server_urls: list[str] = list(server_urls)
+        self.mq_clients: dict[str, MessageQueueClient] = {
+            url: MessageQueueClient(url, context) for url in self._server_urls
+        }
         self._mq_timeout = mq_timeout
 
-        # Lookup state tracking:
+        # One worker thread per server so all lookups can be fired off at once.
+        from concurrent.futures import ThreadPoolExecutor
+        self._executor = ThreadPoolExecutor(
+            max_workers=len(self._server_urls),
+            thread_name_prefix="lmcache-mp-lookup",
+        )
+        # Lookup state tracking (multi-server aware, N>=1):
         # - _pending_lookups: request_ids submitted but not yet resolved
-        # - _finished_lookup_results: cached chunk count keyed by request_id,
-        #   so that repeated calls to check_lookup_result return the same value
-        #   even after the server has already popped the job (exactly-once).
+        #   (resolved == results from ALL servers have been merged).
+        # - _finished_lookup_results: aggregated chunk count keyed by
+        #   request_id, computed as the min hit across servers so a chunk
+        #   only counts as "hit" when every server has it. Cached so that
+        #   repeated calls to check_lookup_result return the same value
+        #   even after the servers have popped the job (exactly-once).
+        # - _per_server_hits: per-server raw hit counts keyed by request_id,
+        #   kept for debugging and consistency reporting.
+        #
+        # Single-server compatibility: when len(server_urls) == 1, min() over
+        # a single value is a no-op, so the aggregated result is identical to
+        # the legacy single-server behavior -- this class is a drop-in
+        # replacement for the original single-server lookup.
         self._pending_lookups: set[str] = set()
         self._finished_lookup_results: dict[str, int] = {}
+        self._per_server_hits: dict[str, dict[str, int]] = {}
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
 
-        # Read chunk size from lmcache
-        try:
-            self.chunk_size = get_lmcache_chunk_size(self.mq_client)
-        except TimeoutError:
-            self.mq_client.close()
-            raise ConnectionError(
-                f"LMCache server did not respond within {mq_timeout}s. "
-                "Is the server running?"
-            ) from None
+        # Fetch chunk_size from every server and verify they all agree.
+        chunk_sizes: dict[str, int] = {}
+        for url, client in self.mq_clients.items():
+            try:
+                chunk_sizes[url] = get_lmcache_chunk_size(client)
+            except TimeoutError:
+                for c in self.mq_clients.values():
+                    c.close()
+                raise ConnectionError(
+                    f"LMCache server {url} did not respond within {mq_timeout}s"
+                ) from None
+
+        # All servers must share chunk_size, otherwise the min() aggregation
+        # over per-server hits would mix different granularities.
+        unique_sizes = set(chunk_sizes.values())
+        assert len(unique_sizes) == 1, (
+            f"All LMCache servers must share the same chunk_size, got {chunk_sizes}"
+        )
+        self.chunk_size = unique_sizes.pop()
+
+        # chunk_size must align to vLLM block_size; relied on by lookup / load.
         assert self.chunk_size % vllm_block_size == 0, (
-            "LMCache chunk size should be a multiple of vLLM block size"
+            f"chunk_size ({self.chunk_size}) must be a multiple of "
+            f"vllm_block_size ({vllm_block_size})"
         )
         self.blocks_in_chunk = self.chunk_size // vllm_block_size
 
-        # Health state (shared with heartbeat thread)
-        self._health_event = threading.Event()
-        self._health_event.set()
+        # Health state: one Event per server. The adapter is considered healthy
+        # only if ALL per-server events are set (any unhealthy server taints
+        # the whole adapter, matching the min() semantics used for lookups).
+        self._health_events: dict[str, threading.Event] = {}
+        for url in self._server_urls:
+            ev = threading.Event()
+            ev.set()  # start optimistic; heartbeat will clear on failure
+            self._health_events[url] = ev
 
-        # Heartbeat thread is created but NOT started yet.
-        # It will be lazily started on the first lookup
-        # request, by which time vLLM is fully ready.
+        # Heartbeats: one thread per server so a slow/dead node cannot block
+        # the others. Threads are NOT created here -- they are lazily started
+        # on the first lookup (by then vLLM is fully ready).
         self._heartbeat_interval = heartbeat_interval
-        self._heartbeat: HeartbeatThread | None = None
+        self._heartbeats: dict[str, HeartbeatThread] = {}
         self._heartbeat_lock = threading.Lock()
 
     @property
@@ -283,9 +322,12 @@ class LMCacheMPSchedulerAdapter:
 
     @property
     def is_healthy(self) -> bool:
-        """Whether the LMCache server is healthy."""
-        return self._health_event.is_set()
-
+        """Whether all the LMCache server is healthy."""
+        return all(ev.is_set() for ev in self._health_events.values())
+    
+    def healthy_urls(self) -> list[str]:
+        return [u for u, ev in self._health_events.items() if ev.is_set()]
+    
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first use."""
         if self._heartbeat is not None:
@@ -293,12 +335,14 @@ class LMCacheMPSchedulerAdapter:
         with self._heartbeat_lock:
             if self._heartbeat is not None:
                 return
-            self._heartbeat = HeartbeatThread(
-                mq_client=self.mq_client,
-                health_event=self._health_event,
-                interval=self._heartbeat_interval,
-            )
-            self._heartbeat.start()
+            for url, client in self.mq_clients.items():
+                hb = HeartbeatThread(
+                    mq_client=client,
+                    health_event=self._health_events[url],
+                    interval=self._heartbeat_interval,
+                )
+                hb.start()
+                self._heartbeats[url] = hb 
 
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
@@ -334,6 +378,11 @@ class LMCacheMPSchedulerAdapter:
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
+            logger.warning(
+                "Skip LOOKUP for req=%s because not all servers are healthy: %s",
+                request_id,
+                {u: ev.is_set() for u, ev in self._health_events.items()},
+            )
             return
 
         if request_id in self._pending_lookups:
@@ -350,21 +399,39 @@ class LMCacheMPSchedulerAdapter:
             cache_salt=cache_salt,
         ).no_worker_id_version()
 
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.LOOKUP,
-            [key, self.tp_size],
-        )
-        try:
-            future.result(timeout=self._mq_timeout)
-        except TimeoutError:
-            logger.warning(
-                "LOOKUP request timed out after %ss. Marking server as unhealthy.",
-                self._mq_timeout,
+        # One task per server.
+        def _submit_one(url: str) -> tuple[str, bool]:
+            client = self.mq_clients[url]
+            try:
+                fut = send_lmcache_request(
+                    client, RequestType.LOOKUP, [key, self.tp_size],
+                )
+                fut.result(timeout=self._mq_timeout)
+                return url, True
+            except TimeoutError:
+                logger.warning(
+                    "LOOKUP to %s timed out after %ss; marking unhealthy.",
+                    url, self._mq_timeout,
+                )
+                self._health_events[url].clear()
+                return url, False
+            except Exception as e:
+                logger.error("LOOKUP to %s failed: %s", url, e, exc_info=True)
+                self._health_events[url].clear()
+                return url, False
+
+        # Fan out in parallel; total latency ~= slowest server, not sum.
+        results = list(self._executor.map(_submit_one, self._server_urls))
+
+        # Only track as pending when every server accepted the job.
+        if all(ok for _, ok in results):
+            self._pending_lookups.add(request_id)
+        else:
+            failed = [u for u, ok in results if not ok]
+            logger.error(
+                "[req=%s] LOOKUP failed on servers %s -- fall back to no-hit",
+                request_id, failed,
             )
-            self._health_event.clear()
-            return
-        self._pending_lookups.add(request_id)
 
     @_lmcache_nvtx_annotate
     def check_lookup_result(self, request_id: str) -> int | None:
@@ -397,25 +464,46 @@ class LMCacheMPSchedulerAdapter:
             # Return cached result if the job is already finished
             return self._finished_lookup_results[request_id]
 
-        try:
-            result = send_lmcache_request(
-                self.mq_client,
-                RequestType.QUERY_PREFETCH_STATUS,
-                [request_id],
-            ).result(timeout=self._mq_timeout)
-        except TimeoutError:
-            logger.warning(
-                "QUERY_PREFETCH_STATUS timed out after %ss. "
-                "Marking server as unhealthy.",
-                self._mq_timeout,
+        def _query_one(url: str) -> tuple[str, int | None]:
+            client = self.mq_clients[url]
+            try:
+                r = send_lmcache_request(
+                    client, RequestType.QUERY_PREFETCH_STATUS, [request_id],
+                ).result(timeout=self._mq_timeout)
+                return url, r
+            except TimeoutError:
+                logger.warning(
+                    "QUERY_PREFETCH_STATUS to %s timed out. Marking unhealthy.", url,
+                )
+                self._health_events[url].clear()
+                return url, 0
+            except Exception as e:
+                logger.error("QUERY_PREFETCH_STATUS to %s failed: %s", url, e,
+                            exc_info=True)
+                self._health_events[url].clear()
+                return url, 0
+
+        
+        results = list(self._executor.map(_query_one, self._server_urls))
+
+        per_server: dict[str, int] = {}                                                 
+        for url, r in results:                                                          
+            if r is None:                                                               
+                return None                                                             
+            per_server[url] = int(r)                                                    
+
+                                       
+        min_chunks = min(per_server.values())                                           
+        max_chunks = max(per_server.values())                                                                  
+        if min_chunks != max_chunks:                                                    
+            logger.warning(                                                             
+                "[req=%s] LMCache hit mismatch across servers: %s → take min=%d",       
+                request_id, per_server, min_chunks,                                    
             )
-            self._health_event.clear()
-            return 0
 
-        if result is None:
-            return None
 
-        token_count = result * self.chunk_size
+        self._per_server_hits[request_id] = per_server 
+        token_count = min_chunks * self.chunk_size
         self._finished_lookup_results[request_id] = token_count
         return token_count
 
@@ -434,6 +522,7 @@ class LMCacheMPSchedulerAdapter:
         """
         self._pending_lookups.discard(request_id)
         self._finished_lookup_results.pop(request_id, None)
+        self._per_server_hits.pop(request_id, None)
 
     def free_lookup_locks(
         self,
@@ -463,8 +552,6 @@ class LMCacheMPSchedulerAdapter:
             request_id: The request ID.
             cache_salt: Per-user isolation salt.
         """
-        if not self.is_healthy:
-            return
 
         key = self._create_key(
             token_ids,
@@ -473,11 +560,15 @@ class LMCacheMPSchedulerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         ).no_worker_id_version()
-        send_lmcache_request(
-            self.mq_client,
-            RequestType.FREE_LOOKUP_LOCKS,
-            [key, self.tp_size],
-        )
+        for url, client in self.mq_clients.items():
+            if not self._health_events[url].is_set():
+                continue  
+            try:
+                send_lmcache_request(
+                    client, RequestType.FREE_LOOKUP_LOCKS, [key, self.tp_size],
+                )
+            except Exception as e:
+                logger.error("free_lookup_locks to %s failed: %s", url, e) 
 
     def end_session(self, request_id: str) -> None:
         """
@@ -485,14 +576,17 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the finished request.
         """
-        if not self.is_healthy:
-            return
-
-        send_lmcache_request(
-            self.mq_client,
-            RequestType.END_SESSION,
-            [request_id],
-        )
+        for url, client in self.mq_clients.items():
+            if not self._health_events[url].is_set():
+                continue
+            try:
+                send_lmcache_request(
+                    client, RequestType.END_SESSION, [request_id],
+                )
+            except Exception as e:
+                logger.error("end_session to %s failed: %s", url, e)
+        
+        self._per_server_hits.pop(request_id, None) 
 
     def report_block_allocations(
         self,
@@ -507,14 +601,18 @@ class LMCacheMPSchedulerAdapter:
             records: List of BlockAllocationRecord with per-request
                 block and token allocation deltas.
         """
-        if not self.is_healthy or not records:
+        if not records:
             return
-
-        send_lmcache_request(
-            self.mq_client,
-            RequestType.REPORT_BLOCK_ALLOCATION,
-            [os.getpid(), self.model_name, records],
-        )
+        for url, client in self.mq_clients.items():
+            if not self._health_events[url].is_set():
+                continue
+            try:
+                send_lmcache_request(
+                    client, RequestType.REPORT_BLOCK_ALLOCATION,
+                    [os.getpid(), self.model_name, records],
+                )
+            except Exception as e:
+                logger.error("report_block_allocations to %s failed: %s", url, e) 
 
     # Helper functions
     def _create_key(
@@ -699,17 +797,19 @@ class LMCacheMPWorkerAdapter:
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first use."""
-        if self._heartbeat is not None:
+        if self._heartbeats is not None:
             return
         with self._heartbeat_lock:
-            if self._heartbeat is not None:
+            if self._heartbeats:
                 return
-            self._heartbeat = HeartbeatThread(
-                mq_client=self.mq_client,
-                health_event=self._health_event,
-                interval=self._heartbeat_interval,
-            )
-            self._heartbeat.start()
+            for url, client in self.mq_clients.items():
+                hb = HeartbeatThread(
+                    mq_client=client,
+                    health_event=self._health_events[url],
+                    interval=self._heartbeat_interval,
+                )
+                hb.start()
+                self._heartbeats[url] = hb
 
     @_lmcache_nvtx_annotate
     def submit_store_request(
