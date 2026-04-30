@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
-import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -28,12 +27,14 @@ try:
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
+        ParallelStrategy,
     )
 except ImportError:
     from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration import (
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
+        ParallelStrategy,
     )
 
 if TYPE_CHECKING:
@@ -51,12 +52,6 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
-
-
-def _adapter_accepts_tp_size() -> bool:
-    """Check if the imported adapter accepts tp_size."""
-    sig = inspect.signature(LMCacheMPSchedulerAdapter.__init__)
-    return "tp_size" in sig.parameters
 
 
 # Helper functions
@@ -101,7 +96,7 @@ def extract_world_size_and_kv_rank(
 
 
 def create_scheduler_adapter(
-    server_url: str,
+    server_urls: list[str],
     zmq_context: zmq.Context,
     vllm_config: VllmConfig,
     mq_timeout: float,
@@ -112,29 +107,28 @@ def create_scheduler_adapter(
         vllm_config.parallel_config.rank,
         vllm_config,
     )
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
-
-    # Pass tp_size only when the adapter accepts it so that
-    # a newer vllm can still work with an older LMCache.
-    kwargs: dict[str, Any] = {}
-    if _adapter_accepts_tp_size():
-        kwargs["tp_size"] = tp_size
-
+    parallel_strategy = ParallelStrategy(
+        use_mla=mla_enabled(vllm_config.model_config),
+        kv_world_size=world_size,
+        kv_worker_id=kv_rank,
+        actual_world_size=vllm_config.parallel_config.world_size,
+        actual_worker_id=vllm_config.parallel_config.rank,
+        tp_size=vllm_config.parallel_config.tensor_parallel_size,
+        pp_size=vllm_config.parallel_config.pipeline_parallel_size,
+    )
     return LMCacheMPSchedulerAdapter(
-        server_url,
+        server_urls,
         zmq_context,
         vllm_config.model_config.model,
-        world_size,
-        kv_rank,
         vllm_config.cache_config.block_size,
+        parallel_strategy,
         mq_timeout=mq_timeout,
         heartbeat_interval=heartbeat_interval,
-        **kwargs,
     )
 
 
 def create_worker_adapter(
-    server_url: str,
+    server_urls: list[str],
     zmq_context: zmq.Context,
     vllm_config: VllmConfig,
     mq_timeout: float,
@@ -145,13 +139,40 @@ def create_worker_adapter(
         vllm_config.parallel_config.rank,
         vllm_config,
     )
+    parallel_strategy = ParallelStrategy(
+        use_mla=mla_enabled(vllm_config.model_config),
+        kv_world_size=world_size,
+        kv_worker_id=kv_rank,
+        actual_world_size=vllm_config.parallel_config.world_size,
+        actual_worker_id=vllm_config.parallel_config.rank,
+        tp_size=vllm_config.parallel_config.tensor_parallel_size,
+        pp_size=vllm_config.parallel_config.pipeline_parallel_size,
+    )
+
+    # Compute local server url based on the worker rank so that each
+    # worker talks to a single LMCache server on the same node.
+    actual_world_size = vllm_config.parallel_config.world_size
+    actual_rank = vllm_config.parallel_config.rank
+    n_servers = len(server_urls)
+    assert actual_world_size % n_servers == 0, (
+        f"world_size({actual_world_size}) must be divisible by "
+        f"number of lmcache servers ({n_servers})"
+    )
+
+    ranks_per_node = actual_world_size // n_servers
+    node_id = actual_rank // ranks_per_node
+    local_server_url = server_urls[node_id]
+    logger.info(
+        "Worker rank=%d routed to LMCache server[%d]=%s",
+        actual_rank, node_id, local_server_url,
+    )
+
     return LMCacheMPWorkerAdapter(
-        server_url,
+        local_server_url,
         zmq_context,
         vllm_config.model_config.model,
-        world_size,
-        kv_rank,
         vllm_config.cache_config.block_size,
+        parallel_strategy,
         mq_timeout=mq_timeout,
         heartbeat_interval=heartbeat_interval,
     )
@@ -444,8 +465,11 @@ class LMCacheMPConnector(KVConnectorBase_V1):
     The connector for LMCache multi-process mode.
 
     Extra configs (kv_transfer_config.extra_config):
-    - lmcache.mp.host: the host of the LMCache server.
-    - lmcache.mp.port: the port of the LMCache server.
+    - lmcache.mp.server_urls: comma-separated URLs (or a list) of the
+      LMCache servers, one per node. Takes precedence over
+      lmcache.mp.host / lmcache.mp.port when provided.
+    - lmcache.mp.host: the host of the LMCache server (single-server fallback).
+    - lmcache.mp.port: the port of the LMCache server (single-server fallback).
     - lmcache.mp.mq_timeout: timeout (seconds) for message queue requests.
     - lmcache.mp.heartbeat_interval: interval (seconds) between server
       heartbeat pings.
@@ -460,12 +484,27 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         super().__init__(vllm_config, role, kv_cache_config)
 
         assert vllm_config.kv_transfer_config is not None
-        server_host = vllm_config.kv_transfer_config.get_from_extra_config(
-            "lmcache.mp.host", "tcp://localhost"
+        raw_urls = vllm_config.kv_transfer_config.get_from_extra_config(
+            "lmcache.mp.server_urls", None
         )
-        server_port = vllm_config.kv_transfer_config.get_from_extra_config(
-            "lmcache.mp.port", 5555
-        )
+        if raw_urls is not None:
+            # support server_urls as a string (comma-separated) or a list
+            if isinstance(raw_urls, str):
+                server_urls = [u.strip() for u in raw_urls.split(",") if u.strip()]
+            else:
+                server_urls = list(raw_urls)
+        else:
+            server_host = vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.host", "tcp://localhost"
+            )
+            server_port = vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.port", 5555
+            )
+            server_urls = [f"{server_host}:{server_port}"]
+
+        assert len(server_urls) >= 1, "At least one LMCache server URL is required"
+        logger.info("LMCache MP server urls: %s", server_urls)
+
         mq_timeout = float(
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "lmcache.mp.mq_timeout", 300.0
@@ -477,11 +516,10 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             )
         )
 
-        server_url = f"{server_host}:{server_port}"
         zmq_context = zmq.Context.instance()
         if self.role == KVConnectorRole.SCHEDULER:
             self.scheduler_adapter = create_scheduler_adapter(
-                server_url,
+                server_urls,
                 zmq_context,
                 vllm_config,
                 mq_timeout,
@@ -490,7 +528,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
         elif self.role == KVConnectorRole.WORKER:
             self.worker_adapter = create_worker_adapter(
-                server_url,
+                server_urls,
                 zmq_context,
                 vllm_config,
                 mq_timeout,
@@ -1065,3 +1103,8 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 "[KVConnector] Cleaned up request_tracker for request %s",
                 request_id,
             )
+
+
+# Backward/forward-compatible alias so that configurations using
+# ``kv_connector="LMCacheMPConnectorDynamic"`` also work.
+LMCacheMPConnectorDynamic = LMCacheMPConnector
