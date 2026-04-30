@@ -158,7 +158,7 @@ def test_server_handler_registered():
 
 def test_adapter_free_lookup_locks_sends_request():
     """LMCacheMPSchedulerAdapter.free_lookup_locks should send a FREE_LOOKUP_LOCKS
-    request with the correct key payload."""
+    request with the correct key payload to every healthy server."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         LMCacheMPSchedulerAdapter,
@@ -170,14 +170,25 @@ def test_adapter_free_lookup_locks_sends_request():
     adapter.chunk_size = 256
     adapter.blocks_in_chunk = 16
     adapter.parallel_strategy = ParallelStrategy(False, 1, 0, 1, 0, 1, 1)
-    adapter._health_event = threading.Event()
-    adapter._health_event.set()
     adapter._mq_timeout = 30.0
 
-    mock_client = MagicMock(spec=MessageQueueClient)
+    # Multi-server setup: two mp servers running on different hosts.
+    url_a = "tcp://host-a:5555"
+    url_b = "tcp://host-b:5555"
+    adapter._server_urls = [url_a, url_b]
+
+    mock_client_a = MagicMock(spec=MessageQueueClient)
+    mock_client_b = MagicMock(spec=MessageQueueClient)
     mock_future = MagicMock()
-    mock_client.submit_request.return_value = mock_future
-    adapter.mq_client = mock_client
+    mock_client_a.submit_request.return_value = mock_future
+    mock_client_b.submit_request.return_value = mock_future
+    adapter.mq_clients = {url_a: mock_client_a, url_b: mock_client_b}
+
+    # All servers healthy.
+    adapter._health_events = {url_a: threading.Event(), url_b: threading.Event()}
+    for ev in adapter._health_events.values():
+        ev.set()
+
     adapter._pending_lookups = set()
 
     token_ids = list(range(512))
@@ -188,27 +199,32 @@ def test_adapter_free_lookup_locks_sends_request():
         request_id="req-1",
     )
 
-    mock_client.submit_request.assert_called_once()
-    call_args = mock_client.submit_request.call_args
-    req_type = call_args[0][0]
-    payloads = call_args[0][1]
-    assert req_type == RequestType.FREE_LOOKUP_LOCKS
+    # Each healthy server must receive exactly one FREE_LOOKUP_LOCKS request.
+    for mc in (mock_client_a, mock_client_b):
+        mc.submit_request.assert_called_once()
+        call_args = mc.submit_request.call_args
+        req_type = call_args[0][0]
+        payloads = call_args[0][1]
+        assert req_type == RequestType.FREE_LOOKUP_LOCKS
 
-    # Payload should be [key, tp_size]
-    assert isinstance(payloads, list)
-    assert len(payloads) == 2
+        # Payload should be [key, tp_size]
+        assert isinstance(payloads, list)
+        assert len(payloads) == 2
 
-    key = payloads[0]
-    assert isinstance(key, IPCCacheEngineKey)
-    assert key.worker_id is None
-    assert key.model_name == "test_model"
-    assert key.request_id == "req-1"
-    assert payloads[1] == 1  # tp_size
+        key = payloads[0]
+        assert isinstance(key, IPCCacheEngineKey)
+        assert key.worker_id is None
+        assert key.model_name == "test_model"
+        assert key.request_id == "req-1"
+        assert payloads[1] == 1  # tp_size
 
 
 def test_adapter_free_lookup_locks_key_matches_lookup():
     """The key created by free_lookup_locks should match the key created by
     maybe_submit_lookup_request (no_worker_id_version, same start/end)."""
+    # Standard
+    from concurrent.futures import ThreadPoolExecutor
+
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         LMCacheMPSchedulerAdapter,
@@ -220,51 +236,77 @@ def test_adapter_free_lookup_locks_key_matches_lookup():
     adapter.chunk_size = 256
     adapter.blocks_in_chunk = 16
     adapter.parallel_strategy = ParallelStrategy(False, 1, 0, 1, 0, 1, 1)
-    adapter._health_event = threading.Event()
-    adapter._health_event.set()
     adapter._mq_timeout = 30.0
-    adapter._heartbeat = None
+    adapter._heartbeats = {}
     adapter._heartbeat_lock = threading.Lock()
     adapter._heartbeat_interval = 5.0
 
-    mock_client = MagicMock(spec=MessageQueueClient)
+    # Multi-server setup.
+    url_a = "tcp://host-a:5555"
+    url_b = "tcp://host-b:5555"
+    adapter._server_urls = [url_a, url_b]
+
+    mock_client_a = MagicMock(spec=MessageQueueClient)
+    mock_client_b = MagicMock(spec=MessageQueueClient)
     mock_future = MagicMock()
     mock_future.result.return_value = None  # LOOKUP returns None
-    mock_client.submit_request.return_value = mock_future
-    adapter.mq_client = mock_client
+    mock_client_a.submit_request.return_value = mock_future
+    mock_client_b.submit_request.return_value = mock_future
+    adapter.mq_clients = {url_a: mock_client_a, url_b: mock_client_b}
+
+    adapter._health_events = {url_a: threading.Event(), url_b: threading.Event()}
+    for ev in adapter._health_events.values():
+        ev.set()
+
+    # maybe_submit_lookup_request fans out via this executor.
+    adapter._executor = ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="test-lmcache-lookup"
+    )
     adapter._pending_lookups = set()
 
     token_ids = list(range(512))
 
-    # Submit lookup – patch heartbeat to avoid spawning a real thread
-    with patch.object(adapter, "_ensure_heartbeat_started"):
-        adapter.maybe_submit_lookup_request("req-1", token_ids)
-    lookup_call = mock_client.submit_request.call_args
-    lookup_payloads = lookup_call[0][1]
-    lookup_key = lookup_payloads[0]
+    try:
+        # Submit lookup – patch heartbeat to avoid spawning a real thread
+        with patch.object(adapter, "_ensure_heartbeat_started"):
+            adapter.maybe_submit_lookup_request("req-1", token_ids)
 
-    mock_client.submit_request.reset_mock()
+        # Both servers should have been called; grab the key from server A.
+        mock_client_a.submit_request.assert_called_once()
+        mock_client_b.submit_request.assert_called_once()
+        lookup_call = mock_client_a.submit_request.call_args
+        lookup_payloads = lookup_call[0][1]
+        lookup_key = lookup_payloads[0]
 
-    # Submit free_lookup_locks with aligned end
-    aligned_end = (len(token_ids) // adapter.chunk_size) * adapter.chunk_size
-    adapter.free_lookup_locks(
-        token_ids=token_ids,
-        start=0,
-        end=aligned_end,
-        request_id="req-1",
-    )
-    free_call = mock_client.submit_request.call_args
-    free_payloads = free_call[0][1]
-    assert len(free_payloads) == 2
-    free_key = free_payloads[0]
-    assert free_payloads[1] == 1  # tp_size
+        mock_client_a.submit_request.reset_mock()
+        mock_client_b.submit_request.reset_mock()
 
-    # Keys should be identical
-    assert lookup_key.model_name == free_key.model_name
-    assert lookup_key.world_size == free_key.world_size
-    assert lookup_key.worker_id == free_key.worker_id
-    assert lookup_key.worker_id is None
-    assert lookup_key.start == free_key.start
-    assert lookup_key.end == free_key.end
-    assert lookup_key.request_id == free_key.request_id
-    assert lookup_key.token_ids == free_key.token_ids
+        # Submit free_lookup_locks with aligned end
+        aligned_end = (len(token_ids) // adapter.chunk_size) * adapter.chunk_size
+        adapter.free_lookup_locks(
+            token_ids=token_ids,
+            start=0,
+            end=aligned_end,
+            request_id="req-1",
+        )
+        # free_lookup_locks must also fan out to every healthy server.
+        mock_client_a.submit_request.assert_called_once()
+        mock_client_b.submit_request.assert_called_once()
+
+        free_call = mock_client_a.submit_request.call_args
+        free_payloads = free_call[0][1]
+        assert len(free_payloads) == 2
+        free_key = free_payloads[0]
+        assert free_payloads[1] == 1  # tp_size
+
+        # Keys should be identical across LOOKUP and FREE_LOOKUP_LOCKS
+        assert lookup_key.model_name == free_key.model_name
+        assert lookup_key.world_size == free_key.world_size
+        assert lookup_key.worker_id == free_key.worker_id
+        assert lookup_key.worker_id is None
+        assert lookup_key.start == free_key.start
+        assert lookup_key.end == free_key.end
+        assert lookup_key.request_id == free_key.request_id
+        assert lookup_key.token_ids == free_key.token_ids
+    finally:
+        adapter._executor.shutdown(wait=True)

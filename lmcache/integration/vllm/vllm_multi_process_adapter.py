@@ -329,11 +329,16 @@ class LMCacheMPSchedulerAdapter:
         return [u for u, ev in self._health_events.items() if ev.is_set()]
     
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first use."""
-        if self._heartbeat is not None:
+        """Lazily start heartbeat threads (one per server) on first use.
+
+        Safe to call concurrently; threads are only created once thanks
+        to the lock + membership check on the ``self._heartbeats`` dict.
+        """
+        # Fast path: threads already started for every server.
+        if self._heartbeats:
             return
         with self._heartbeat_lock:
-            if self._heartbeat is not None:
+            if self._heartbeats:
                 return
             for url, client in self.mq_clients.items():
                 hb = HeartbeatThread(
@@ -342,7 +347,7 @@ class LMCacheMPSchedulerAdapter:
                     interval=self._heartbeat_interval,
                 )
                 hb.start()
-                self._heartbeats[url] = hb 
+                self._heartbeats[url] = hb
 
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
@@ -714,7 +719,7 @@ class LMCacheMPWorkerAdapter:
         # request, by which time vLLM is fully ready (model loaded,
         # KV caches allocated, warmup & CUDA graph capture done).
         self._heartbeat_interval = heartbeat_interval
-        self._heartbeat: HeartbeatThread | None = None
+        self._heartbeats: HeartbeatThread | None = None
         self._heartbeat_lock = threading.Lock()
 
         # request telemetry, used for prefill-decode disagg
@@ -796,20 +801,23 @@ class LMCacheMPWorkerAdapter:
             ) from None
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first use."""
+        """Lazily start the heartbeat thread on first use.
+
+        The worker adapter talks to a single server, so there is only
+        one heartbeat thread tied to ``self.mq_client`` /
+        ``self._health_event``.
+        """
         if self._heartbeats is not None:
             return
         with self._heartbeat_lock:
-            if self._heartbeats:
+            if self._heartbeats is not None:
                 return
-            for url, client in self.mq_clients.items():
-                hb = HeartbeatThread(
-                    mq_client=client,
-                    health_event=self._health_events[url],
-                    interval=self._heartbeat_interval,
-                )
-                hb.start()
-                self._heartbeats[url] = hb
+            self._heartbeats = HeartbeatThread(
+                mq_client=self.mq_client,
+                health_event=self._health_event,
+                interval=self._heartbeat_interval,
+            )
+            self._heartbeats.start()
 
     @_lmcache_nvtx_annotate
     def submit_store_request(
