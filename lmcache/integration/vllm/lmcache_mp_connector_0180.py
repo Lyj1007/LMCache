@@ -95,6 +95,44 @@ def extract_world_size_and_kv_rank(
         return world_size // tp_size, rank // tp_size
 
 
+def _compute_sub_world(
+    vllm_config: VllmConfig,
+    n_servers: int,
+    kv_world_size: int,
+    kv_rank: int,
+) -> tuple[int, int, int]:
+    """Compute (sub_world_size, sub_worker_id, server_side_tp_size).
+
+    The sharding rules:
+      * MLA: no sub-world sharding. Each server stores a full copy of
+        the (already tp-collapsed) KV -- sub_world_size == kv_world_size
+        and server_side_tp_size == tp_size (-> extra_count = tp_size - 1
+        on the server).
+      * Non-MLA + n_servers > 1: each server owns a disjoint slice of
+        TP ranks. sub_world_size = actual_world_size // n_servers and
+        sub_worker_id = actual_rank % sub_world_size. server_side_tp_size
+        is set to sub_world_size so that compute_extra_count returns 0
+        (each ObjectKey has exactly one local reader).
+      * Non-MLA + single server: degenerates to the original behavior
+        (sub_world_size == kv_world_size, server_side_tp_size == tp_size).
+    """
+    use_mla = mla_enabled(vllm_config.model_config)
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    actual_world_size = vllm_config.parallel_config.world_size
+    actual_rank = vllm_config.parallel_config.rank
+
+    if use_mla or n_servers <= 1:
+        return kv_world_size, kv_rank, tp_size
+
+    assert actual_world_size % n_servers == 0, (
+        f"world_size({actual_world_size}) must be divisible by "
+        f"number of lmcache servers ({n_servers})"
+    )
+    sub_world_size = actual_world_size // n_servers
+    sub_worker_id = actual_rank % sub_world_size
+    return sub_world_size, sub_worker_id, sub_world_size
+
+
 def create_scheduler_adapter(
     server_urls: list[str],
     zmq_context: zmq.Context,
@@ -107,6 +145,10 @@ def create_scheduler_adapter(
         vllm_config.parallel_config.rank,
         vllm_config,
     )
+    n_servers = len(server_urls)
+    sub_world_size, sub_worker_id, server_side_tp = _compute_sub_world(
+        vllm_config, n_servers, world_size, kv_rank,
+    )
     parallel_strategy = ParallelStrategy(
         use_mla=mla_enabled(vllm_config.model_config),
         kv_world_size=world_size,
@@ -115,6 +157,16 @@ def create_scheduler_adapter(
         actual_worker_id=vllm_config.parallel_config.rank,
         tp_size=vllm_config.parallel_config.tensor_parallel_size,
         pp_size=vllm_config.parallel_config.pipeline_parallel_size,
+        n_servers=n_servers,
+        sub_world_size=sub_world_size,
+        sub_worker_id=sub_worker_id,
+        server_side_tp_size=server_side_tp,
+    )
+    logger.info(
+        "Scheduler adapter: n_servers=%d, kv_world_size=%d, "
+        "sub_world_size=%d, server_side_tp=%d, mla=%s",
+        n_servers, world_size, sub_world_size, server_side_tp,
+        parallel_strategy.use_mla,
     )
     return LMCacheMPSchedulerAdapter(
         server_urls,
@@ -139,6 +191,10 @@ def create_worker_adapter(
         vllm_config.parallel_config.rank,
         vllm_config,
     )
+    n_servers = len(server_urls)
+    sub_world_size, sub_worker_id, server_side_tp = _compute_sub_world(
+        vllm_config, n_servers, world_size, kv_rank,
+    )
     parallel_strategy = ParallelStrategy(
         use_mla=mla_enabled(vllm_config.model_config),
         kv_world_size=world_size,
@@ -147,13 +203,16 @@ def create_worker_adapter(
         actual_worker_id=vllm_config.parallel_config.rank,
         tp_size=vllm_config.parallel_config.tensor_parallel_size,
         pp_size=vllm_config.parallel_config.pipeline_parallel_size,
+        n_servers=n_servers,
+        sub_world_size=sub_world_size,
+        sub_worker_id=sub_worker_id,
+        server_side_tp_size=server_side_tp,
     )
 
     # Compute local server url based on the worker rank so that each
     # worker talks to a single LMCache server on the same node.
     actual_world_size = vllm_config.parallel_config.world_size
     actual_rank = vllm_config.parallel_config.rank
-    n_servers = len(server_urls)
     assert actual_world_size % n_servers == 0, (
         f"world_size({actual_world_size}) must be divisible by "
         f"number of lmcache servers ({n_servers})"
