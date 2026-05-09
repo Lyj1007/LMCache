@@ -1258,3 +1258,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 "[KVConnector] Cleaned up request_tracker for request %s",
                 request_id,
             )
+            
+# Backward/forward-compatible alias so that configurations using
+# ``kv_connector="LMCacheMPConnectorDynamic"`` also work.
+LMCacheMPConnectorDynamic = LMCacheMPConnector

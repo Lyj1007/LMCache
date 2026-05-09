@@ -419,16 +419,6 @@ class LMCacheMPSchedulerAdapter:
         self._heartbeats: dict[str, HeartbeatThread] = {}
         self._heartbeat_lock = threading.Lock()
 
-    @property
-    def world_size(self) -> int:
-        """Get the per-server (sub) kv world size.
-
-        In multi-server deployments the connector passes ``sub_world_size``
-        (``actual_world_size // n_servers``) as ``kv_world_size``, so that
-        ``ipc_key_to_object_keys`` only expands into the ObjectKeys that
-        actually reside on this server.  For single-server deployments this
-        equals the full kv_world_size.
-        """
 
     @property
     def world_size(self) -> int:
@@ -905,7 +895,12 @@ class LMCacheMPWorkerAdapter:
         so this property only reads the shared event.
         """
         return self._health_event.is_set()
-
+    
+    @property
+    def world_size(self) -> int:
+        """Get the kv world size."""
+        return self.parallel_strategy.kv_world_size
+    
     @property
     def worker_id(self) -> int:
         """Get the kv worker id."""
