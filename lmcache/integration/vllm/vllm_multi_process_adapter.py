@@ -422,31 +422,15 @@ class LMCacheMPSchedulerAdapter:
 
     @property
     def world_size(self) -> int:
-        """Get the per-server kv world size used for ObjectKey generation.
-
-        For multi-server deployments, returns ``kv_world_size_per_node`` so
-        that ``ipc_key_to_object_keys`` expands only into the ObjectKeys that
-        reside on the local server.  For single-server deployments this equals
-        the full ``kv_world_size``.
-        """
-        if self.parallel_strategy.n_servers > 1:
+        if not self.parallel_strategy.use_mla and self.parallel_strategy.n_servers > 1:
             return self.parallel_strategy.kv_world_size_per_node
-        else:
-            return self.parallel_strategy.kv_world_size
+        return self.parallel_strategy.kv_world_size
 
     @property
     def tp_size(self) -> int:
-        """Get the TP size forwarded to the LMCache server.
-
-        Used by the server to compute the per-chunk multi-reader lock count
-        (``compute_extra_count``).  For multi-server deployments, returns
-        ``tp_size_per_node`` which reflects the TP ranks managed by the local
-        server.  For single-server deployments this equals the full ``tp_size``.
-        """
-        if self.parallel_strategy.n_servers > 1:
-            return self.parallel_strategy.tp_size_per_node
-        else:
-            return self.parallel_strategy.tp_size
+        if not self.parallel_strategy.use_mla and self.parallel_strategy.n_servers > 1:
+            return self.parallel_strategy.kv_world_size_per_node
+        return self.parallel_strategy.tp_size
 
 
     @property
@@ -898,12 +882,14 @@ class LMCacheMPWorkerAdapter:
     
     @property
     def world_size(self) -> int:
-        """Get the kv world size."""
+        if not self.parallel_strategy.use_mla and self.parallel_strategy.n_servers > 1:
+            return self.parallel_strategy.kv_world_size_per_node
         return self.parallel_strategy.kv_world_size
-    
+
     @property
     def worker_id(self) -> int:
-        """Get the kv worker id."""
+        if not self.parallel_strategy.use_mla and self.parallel_strategy.n_servers > 1:
+            return self.parallel_strategy.actual_worker_id % self.parallel_strategy.kv_world_size_per_node
         return self.parallel_strategy.kv_worker_id
 
     @property
