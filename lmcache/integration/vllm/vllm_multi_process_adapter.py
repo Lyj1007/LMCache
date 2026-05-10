@@ -428,10 +428,9 @@ class LMCacheMPSchedulerAdapter:
 
     @property
     def tp_size(self) -> int:
-        if not self.parallel_strategy.use_mla and self.parallel_strategy.n_servers > 1:
-            return self.parallel_strategy.kv_world_size_per_node
+        if self.parallel_strategy.n_servers > 1:
+            return self.parallel_strategy.tp_size_per_node
         return self.parallel_strategy.tp_size
-
 
     @property
     def is_healthy(self) -> bool:
