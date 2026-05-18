@@ -802,6 +802,11 @@ class LMCacheMPWorkerAdapter:
 
         # Registered kv caches from vLLM
         self.kv_caches: dict[str, torch.Tensor] = {}
+        # Engine-supplied layout-hint overrides cached by
+        # ``register_kv_caches`` so the heartbeat recovery path re-
+        # registers with the same hints (e.g.
+        # ``per_layer_logical_block_size`` for hybrid KV cache groups).
+        self.extra_layout_hints: dict[str, object] | None = None
 
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
@@ -908,13 +913,29 @@ class LMCacheMPWorkerAdapter:
             == 0
         )
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        extra_layout_hints: dict[str, object] | None = None,
+    ) -> None:
         """
         Register the kv caches with LMCache server.
 
         Args:
             kv_caches: A dict of kv caches to register. The keys are the
                 layer names and the values are the corresponding tensors.
+            extra_layout_hints: Optional engine-supplied additions to the
+                :class:`~lmcache.v1.gpu_connector.utils.LayoutHints`
+                dict produced by :func:`vllm_layout_hints`. Keys present
+                here override the auto-detected ones (e.g. ``kv_layout``)
+                — callers should use this to add fields the adapter
+                cannot derive on its own, such as
+                ``per_layer_logical_block_size`` (required for vLLM's
+                hybrid KV cache manager; see the field docstring on
+                :class:`~lmcache.v1.gpu_connector.utils.LayoutHints`).
+                Pass ``None`` to use only the auto-detected hints. The
+                hints are cached on the adapter so the heartbeat
+                recovery path re-registers with the same set.
 
         Raises:
             ConnectionError: if the server does not respond within
@@ -922,6 +943,7 @@ class LMCacheMPWorkerAdapter:
         """
         logger.info("Registering kv caches")
         self.kv_caches = kv_caches
+        self.extra_layout_hints = extra_layout_hints
         self._send_register_kv_caches_request(kv_caches)
 
     def _send_register_kv_caches_request(
@@ -930,7 +952,9 @@ class LMCacheMPWorkerAdapter:
         """Submit a REGISTER_KV_CACHE request and wait for the response.
 
         Shared by the public ``register_kv_caches`` entry point and the
-        recovery path inside ``is_healthy``.
+        recovery path inside ``is_healthy``. Uses
+        ``self.extra_layout_hints`` (cached by ``register_kv_caches``)
+        so the recovery path re-registers with identical hints.
 
         Args:
             kv_caches: The KV cache dict to register.
@@ -942,10 +966,12 @@ class LMCacheMPWorkerAdapter:
         # First Party
         from lmcache.integration.vllm.utils import vllm_layout_hints
 
-        layout_hints = vllm_layout_hints()
+        layout_hints = dict(vllm_layout_hints())
         layout_hints["inference_engine_logical_block_size"] = (
             self.vllm_logical_block_size
         )
+        if self.extra_layout_hints:
+            layout_hints.update(self.extra_layout_hints)
         future = send_lmcache_request(
             self.mq_client,
             RequestType.REGISTER_KV_CACHE,
