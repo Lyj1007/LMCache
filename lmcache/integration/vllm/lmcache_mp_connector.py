@@ -356,9 +356,12 @@ class LMCacheMPRequestMetadata:
             start_token_idx = start * vllm_block_size
             end_token_idx = end * vllm_block_size
             token_ids = list(tracker.all_token_ids)
+            # ``LoadStoreOp.block_ids`` is now a per-namespace
+            # ``list[list[int]]``. Legacy non-hybrid connectors use a
+            # single namespace; wrap in a length-1 outer list.
             op = LoadStoreOp(
                 token_ids=token_ids,
-                block_ids=block_ids,
+                block_ids=[block_ids],
                 start=start_token_idx,
                 end=end_token_idx,
             )
@@ -424,7 +427,7 @@ class LMCacheMPRequestMetadata:
 
             op = LoadStoreOp(
                 token_ids=token_ids,
-                block_ids=block_ids,
+                block_ids=[block_ids],
                 start=start_token_idx,
                 end=end_token_idx,
                 skip_first_n_tokens=skip_first_n_tokens,
