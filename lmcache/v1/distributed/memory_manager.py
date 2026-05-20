@@ -91,6 +91,18 @@ class L1MemoryManager:
         )
         if objects is None:
             return L1Error.OUT_OF_MEMORY, []
+        # Propagate ``full_attn_bytes`` from the layout descriptor to every
+        # freshly allocated MemoryObj's metadata. Doing it here — in the
+        # single allocate(layout_desc, count) entry point — avoids having
+        # to thread a new parameter through ~14 ``batched_allocate``
+        # implementations across allocators and storage backends.
+        # ``MemoryObjMetadata`` is a non-frozen dataclass, so direct
+        # assignment is safe. Sentinel ``0`` (no SWA / non-chunked path)
+        # leaves objects in the legacy state where retrieves do a full
+        # H2D, which is byte-level identical to pre-refactor behavior.
+        if layout_desc.full_attn_bytes > 0:
+            for obj in objects:
+                obj.meta.full_attn_bytes = layout_desc.full_attn_bytes
         return L1Error.SUCCESS, objects
 
     def free(self, mem_objs: list[MemoryObj]) -> L1Error:

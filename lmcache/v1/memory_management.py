@@ -138,6 +138,22 @@ class MemoryObjMetadata:
     shapes: Optional[list[torch.Size]] = None
     dtypes: Optional[list[torch.dtype]] = None
 
+    # Byte length of the "essential" prefix (all full-attention groups)
+    # within this object. ``0`` (the default) means either "no SWA / all
+    # bytes are essential" (fresh allocation under a non-SWA layout) or
+    # "legacy on-disk object without this field" (old caches deserialized
+    # via :meth:`from_dict`). Both interpretations are byte-level
+    # equivalent to the pre-refactor full-read behavior — the retrieve
+    # path treats ``0`` as a sentinel for "do not short-read".
+    #
+    # For SWA-aware allocations this is set after
+    # :class:`MemoryAllocatorInterface.batched_allocate` returns, by
+    # :class:`L1MemoryManager.allocate` reading
+    # :attr:`MemoryLayoutDesc.full_attn_bytes`. Keeping the propagation
+    # in one place avoids threading a new parameter through every
+    # ``batched_allocate`` implementation in the tree.
+    full_attn_bytes: int = 0
+
     def to_dict(self):
         # Note(Kuntai): this is used for serializing MemoryObjMetadata via
         # msgpack.
@@ -151,6 +167,7 @@ class MemoryObjMetadata:
             "fmt": self.fmt.value,
             "shapes": [list(shape) for shape in self.shapes] if self.shapes else None,
             "dtypes": [str(dtype) for dtype in self.dtypes] if self.dtypes else None,
+            "full_attn_bytes": self.full_attn_bytes,
         }
 
     @staticmethod
@@ -174,6 +191,8 @@ class MemoryObjMetadata:
             fmt=MemoryFormat(d["fmt"]),
             shapes=shapes,
             dtypes=dtypes,
+            # Backward-compat: missing key on legacy caches => 0 sentinel.
+            full_attn_bytes=d.get("full_attn_bytes", 0),
         )
 
     def get_size(self) -> int:
