@@ -149,15 +149,9 @@ class MemoryLayoutDesc:
     shapes: list[torch.Size]
     dtypes: list[torch.dtype]
 
-    # Byte length of the "essential" prefix (all full-attention groups)
-    # within each chunk-sized memory object produced under this layout.
-    # ``0`` is the sentinel meaning "no SWA / all bytes are essential";
-    # retrieves under that sentinel fall back to the original full-object
-    # H2D path. When ``> 0 and < total_chunk_bytes``, the trailing
-    # ``total - full_attn_bytes`` bytes are the SWA-suffix region that
-    # the retrieve path may skip for non-tail chunks (under PR #3261's
-    # SWA-suffix-only design). Populated by :func:`get_layout_desc` only
-    # for the chunked store/retrieve hot path on SWA-bearing models.
+    # Byte length of the full-attention prefix in each chunk. ``0`` is the
+    # sentinel for "no SWA / all bytes essential"; otherwise the trailing
+    # ``total - full_attn_bytes`` bytes are the skippable SWA suffix.
     full_attn_bytes: int = 0
 
     def __post_init__(self):

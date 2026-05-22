@@ -149,18 +149,8 @@ def get_layout_desc(gpu_context: GPUCacheContext, num_tokens: int) -> MemoryLayo
             shapes.append(gpu_context.get_kv_buffer_shape(num_tokens, group_idx))
     dtypes = [groups[group_idx].dtype for group_idx in range(num_groups)]
 
-    # ``full_attn_bytes`` is only meaningful for the chunked store/retrieve
-    # hot path on SWA-bearing models. It tells the retrieve path how many
-    # bytes of each MemoryObj are "essential" (= the prefix covering all
-    # full-attention groups under PR #3261's SWA-suffix-only design); the
-    # trailing bytes are the SWA suffix, which is provably unused for any
-    # non-tail chunk. We populate it only when:
-    #   - this layout corresponds to one full chunk (token count matches
-    #     ``lmcache_logical_chunk_size``), AND
-    #   - the registered model has at least one SWA group.
-    # All other call sites — partial chunks, non-SWA models — leave the
-    # field at its sentinel ``0`` so retrieves fall back to the original
-    # full-object H2D path with byte-level identical behavior.
+    # Populate full_attn_bytes only on the chunked hot path for SWA-bearing
+    # models; otherwise leave it at the 0 sentinel.
     full_attn_bytes = 0
     if (
         num_tokens == gpu_context.lmcache_logical_chunk_size
@@ -176,63 +166,28 @@ def _make_short_memory_obj_view(
     memory_obj: MemoryObj,
     short_bytes: int,
 ) -> MemoryObj:
-    """Return a non-owning, fixed-length view of ``memory_obj`` whose
-    :meth:`MemoryObj.get_size` reports ``short_bytes`` instead of the
-    full physical size of the underlying buffer.
+    """Return a non-owning view of ``memory_obj`` whose ``get_size()``
+    reports ``short_bytes``. Used to short-H2D the full-attention prefix
+    of non-tail chunks under SWA layouts (``lmcache_memcpy_async_h2d``
+    asserts ``meta.get_size() == gpu_buffer.nbytes``).
 
-    Used by the retrieve path to do a short H2D into the
-    ``full_attn_bytes`` essential prefix of a chunk slot when the
-    corresponding chunk is a non-tail chunk (i.e. its SWA suffix is
-    provably unused by any future query under PR #3261's
-    SWA-suffix-only design). The short view is necessary because
-    :func:`lmcache_memcpy_async_h2d` asserts
-    ``memory_obj.get_size() == gpu_buffer.nbytes``; without a short
-    view we'd have to either widen the GPU destination (defeating the
-    optimization) or modify the helper itself (more invasive).
-
-    Properties of the returned view:
-      * Underlying ``raw_data`` buffer is **shared** with
-        ``memory_obj``; no allocation, no memcpy.
-      * ``parent_allocator`` is ``None`` so the view's ``__del__`` is a
-        no-op (the view will not free the original buffer when GC'd).
-      * ``parent()`` returns ``None`` — H2D dispatches the non-lazy
-        path (``src_tensor.view(uint8)[:size].copy_(...)``) regardless
-        of the original object's allocator family. The non-lazy path
-        slices the first ``short_bytes`` bytes of the shared buffer,
-        which is exactly the essential prefix.
-      * ``meta.shapes`` / ``meta.dtypes`` are forced to ``None`` so
-        :class:`TensorMemoryObj` rebuilds ``group_prefix_sum`` as
-        ``[0, short_bytes]`` and ``get_size()`` returns ``short_bytes``
-        (not the original chunk's full byte count).
-
-    Lifetime requirement: callers must keep the returned view alive
-    until the H2D copy is enqueued on the stream (i.e. until
-    :func:`lmcache_memcpy_async_h2d` returns). The retrieve loop
-    enforces this by collecting all short views into a keep-alive list
-    that is cleared only after the loop's enqueue phase finishes.
+    The view shares ``raw_data`` with ``memory_obj`` (no copy); its
+    ``parent_allocator`` is None so ``__del__`` is inert. Callers must
+    keep the view alive until the H2D copy is enqueued.
     """
     short_meta = MemoryObjMetadata(
         shape=torch.Size([short_bytes]),
-        # uint8 + a 1-D shape => meta.get_size() = short_bytes * 1 byte.
-        # TensorMemoryObj.__init__ requires dtype is not None and asserts it.
+        # uint8 + 1-D shape => get_size() == short_bytes.
         dtype=torch.uint8,
-        # Address fields below are kept identical to the original
-        # metadata for diagnostic continuity. They are not used by the
-        # H2D dispatcher's non-lazy branch (which we always take by
-        # virtue of parent_allocator=None below).
         address=memory_obj.meta.address,
         phy_size=memory_obj.meta.phy_size,
-        # ref_count=0 + parent_allocator=None ensures __del__ is inert.
         ref_count=0,
         pin_count=0,
         fmt=memory_obj.meta.fmt,
-        # Forcing both to None makes TensorMemoryObj treat this view as
-        # a single contiguous segment of length ``meta.get_size()``,
-        # i.e. ``short_bytes``.
+        # shapes/dtypes None so TensorMemoryObj treats this as a single
+        # contiguous segment of length short_bytes.
         shapes=None,
         dtypes=None,
-        # Self-describing as non-SWA-aware so any downstream code that
-        # branches on full_attn_bytes treats the view as a plain object.
         full_attn_bytes=0,
     )
     return TensorMemoryObj(
@@ -708,19 +663,13 @@ class MPCacheEngine:
         def _retrieve_loop(keys: list[ObjectKey], memory_objs: list[MemoryObj]) -> None:
             _BATCH_SIZE = gpu_context.max_batch_size
             groups = gpu_context.kv_layer_groups_manager.kv_layer_groups
-            # Pre-compute SWA short-read bookkeeping. Only the *last* chunk
-            # of the entire retrieve has SWA bytes that any future query may
-            # actually consume (it provides the cross-chunk "left half" of
-            # the SWA window for decode startup); every earlier chunk's SWA
-            # suffix is dead data we can safely skip in both H2D and scatter.
+            # Only the tail chunk of the entire retrieve carries SWA bytes
+            # that may be consumed by future queries; non-tail chunks can
+            # skip the SWA suffix in both H2D and scatter.
             has_swa = gpu_context.has_swa_groups()
             last_chunk_global_idx = len(memory_objs) - 1
-            # Keeps short MemoryObj views alive across the H2D enqueue
-            # window. A view's __del__ is a no-op (parent_allocator=None),
-            # but we still hold the references to ensure the underlying
-            # raw_data tensors aren't dropped by the original objects'
-            # cleanup before the enqueued copies execute. Cleared in the
-            # finally-block at the end of the loop.
+            # Keep short MemoryObj views alive across the H2D enqueue
+            # window; cleared after the loop.
             short_view_keepalive: list[MemoryObj] = []
             for batch_idx, memory_obj_batch in enumerate(
                 batched_iteration(memory_objs, batch_size=_BATCH_SIZE)
@@ -757,17 +706,9 @@ class MPCacheEngine:
 
                 # Copy from CPU to GPU tmp buffers, then scatter to paged KV — per group
                 # H2D copy: each memory_obj maps to its own batch slot.
-                #
-                # SWA short-read fast path: for non-tail chunks under a
-                # SWA-bearing layout, only copy the ``full_attn_bytes``
-                # essential prefix (full-attention groups). The trailing
-                # SWA-suffix region of the GPU slot is left as residual
-                # bytes — the scatter phase below skips SWA groups for
-                # non-tail chunks, so those residual bytes are never
-                # written into the paged KV. ``full_attn_bytes`` on the
-                # MemoryObj's metadata is the source of truth (populated
-                # at allocate-time by L1MemoryManager.allocate);
-                # ``has_swa`` gates the optimization at the layout level.
+                # SWA short-read: for non-tail chunks under a SWA layout,
+                # only copy the full_attn_bytes prefix; the SWA suffix is
+                # left as residual since scatter skips SWA on non-tail.
                 for chunk_idx, memory_obj in enumerate(memory_obj_batch):
                     global_chunk_idx = start_chunk_id + chunk_idx
                     is_tail = global_chunk_idx == last_chunk_global_idx
@@ -786,9 +727,7 @@ class MPCacheEngine:
                         gpu_dst = gpu_context.get_essential_chunk_view(chunk_idx)
                         lmcache_memcpy_async_h2d(short_view, gpu_dst)
                     else:
-                        # Full H2D: tail chunk, non-SWA model, or legacy
-                        # cache (full_attn_bytes==0 sentinel) — byte-level
-                        # identical to the pre-refactor behavior.
+                        # Full H2D: tail chunk, non-SWA, or legacy cache.
                         lmcache_memcpy_async_h2d(
                             memory_obj,
                             gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=chunk_idx),
@@ -801,29 +740,16 @@ class MPCacheEngine:
                         group.kv_cache_group_id
                     ]
 
-                    # ----------------------------------------------------
-                    # SWA tail-only scatter (correctness-critical):
-                    # for SWA groups, only the tail chunk of the entire
-                    # retrieve has bytes that may be consumed by future
-                    # queries. Non-tail chunks under SWA had their H2D
-                    # short-read above, so the GPU slot's SWA region
-                    # holds residual bytes — we must NOT scatter those
-                    # to paged KV (would corrupt the cache). When the
-                    # tail chunk falls within this batch, we scatter
-                    # only that single chunk's SWA bytes; otherwise we
-                    # skip this SWA group entirely for this batch.
-                    # ----------------------------------------------------
+                    # SWA tail-only scatter: under SWA, only the tail
+                    # chunk's SWA bytes may be consumed; non-tail chunks
+                    # had a short H2D so their SWA region is residual
+                    # and must NOT be scattered to paged KV.
                     if has_swa and group.sliding_window > 0:
                         tail_local_idx = last_chunk_global_idx - start_chunk_id
                         if not (0 <= tail_local_idx < batch_len):
-                            # Tail chunk is in a different batch (or
-                            # there is none in this loop iteration);
-                            # nothing to scatter for this SWA group.
+                            # Tail chunk not in this batch.
                             continue
-                        # Build single-chunk gather index: trailing
-                        # ``bpc_g`` blocks of the tail chunk's namespace
-                        # slot. Same SWA-suffix gather formula as the
-                        # original PR, but restricted to one chunk.
+                        # Trailing bpc_g blocks of the tail chunk's slot.
                         tail_chunk_global = start_chunk_id + tail_local_idx
                         chunk_offset = tail_chunk_global * bpc_full_g + (
                             bpc_full_g - bpc_g
@@ -835,9 +761,6 @@ class MPCacheEngine:
                         )
                         gather_idx = within_chunk + chunk_offset
                         chunk_block_ids_gpu = ns_block_ids_gpu[gather_idx]
-                        # Per-group skip math, same formula as below but
-                        # scoped to this branch since we ``continue``
-                        # before the shared skip code runs.
                         if skip_tokens_in_chunk % group.logical_block_size != 0:
                             logger.error(
                                 "skip_first_n_tokens (%d) is not aligned to "
@@ -868,21 +791,14 @@ class MPCacheEngine:
                         )
                         continue
 
-                    # ----------------------------------------------------
-                    # Full-attention groups (or SWA-bearing layouts where
-                    # this particular group is full-attention):
-                    # original PR scatter logic, unchanged.
-                    # ----------------------------------------------------
+                    # Full-attention groups: original scatter logic.
                     if group.sliding_window > 0 and bpc_g != bpc_full_g:
                         # SWA-suffix: pick the trailing ``bpc_g`` block IDs
                         # from each ``bpc_full_g``-sized chunk slot in
                         # ``ns_block_ids_gpu``. Build a flat gather index
                         # ``[batch_len * bpc_g]`` once per kernel call.
-                        # NOTE: this branch is now unreachable when
-                        # ``has_swa`` is True (the tail-only branch above
-                        # consumes all ``sliding_window > 0`` groups);
-                        # kept for defensive correctness in case
-                        # ``has_swa`` ever desyncs from per-group state.
+                        # Defensive fallback: unreachable when has_swa is
+                        # True (handled by the tail-only branch above).
                         chunk_offsets = torch.arange(
                             batch_len,
                             device=ns_block_ids_gpu.device,
@@ -955,12 +871,8 @@ class MPCacheEngine:
                         gpu_context.gpu_kv_format_,
                         skip_blocks_in_chunk_g,
                     )
-            # End of all-batches loop — the H2D copies and scatter kernels
-            # have all been enqueued on the stream. The short MemoryObj
-            # views can now be safely dropped: their __del__ is inert
-            # (parent_allocator=None) and the underlying raw_data tensors
-            # are still referenced by the original ``memory_objs`` list,
-            # which the caller holds for the duration of the stream wait.
+            # All H2D copies and scatter kernels have been enqueued; safe
+            # to drop the short-view keep-alive references.
             short_view_keepalive.clear()
 
         with (

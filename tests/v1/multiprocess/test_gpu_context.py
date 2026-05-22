@@ -60,12 +60,9 @@ def _make_context(
     )
     ctx.kv_layer_groups_manager_ = manager
 
-    # Build flat tmp_gpu_buffer_ with the new (Step 1) per-group byte
-    # placement arrays. All groups in this helper are full-attention
-    # (sliding_window=0), so byte_layout_order_ == range(num_groups) and
-    # the resulting layout is byte-for-byte identical to the old
-    # prefix-sum layout. We still populate the new fields explicitly so
-    # tests assert against the canonical post-refactor shape.
+    # Build flat tmp_gpu_buffer_ with per-group byte placement arrays.
+    # All groups here are full-attention, so byte_layout_order_ is identity
+    # and the layout is byte-for-byte identical to the prefix-sum layout.
     num_groups = len(manager.kv_layer_groups)
     ctx.byte_layout_order_ = list(range(num_groups))
     ctx.tmp_group_byte_starts_ = [0] * num_groups
@@ -78,7 +75,7 @@ def _make_context(
         ctx.tmp_group_byte_sizes_[gidx] = byte_size
         cumulative += byte_size
     ctx.tmp_chunk_bytes_ = cumulative
-    # No SWA groups in this helper: full_attn_bytes_ == tmp_chunk_bytes_.
+    # No SWA groups: full_attn_bytes_ == tmp_chunk_bytes_.
     ctx.full_attn_bytes_ = ctx.tmp_chunk_bytes_
     ctx.lmcache_logical_chunk_size = chunk_size
     ctx.tmp_gpu_buffer_ = torch.empty(
@@ -127,10 +124,8 @@ def _make_context_multi_group(
     )
     ctx.kv_layer_groups_manager_ = manager
 
-    # Build flat tmp_gpu_buffer_ with the new (Step 1) per-group byte
-    # placement arrays. All groups in this helper are full-attention
-    # (sliding_window=0); byte_layout_order_ is identity so layout is
-    # equivalent to the old prefix-sum layout.
+    # Build flat tmp_gpu_buffer_ with per-group byte placement arrays.
+    # All groups here are full-attention; byte_layout_order_ is identity.
     num_groups = len(manager.kv_layer_groups)
     ctx.byte_layout_order_ = list(range(num_groups))
     ctx.tmp_group_byte_starts_ = [0] * num_groups
@@ -299,8 +294,7 @@ class TestMultiGroup:
         assert len(ctx.tmp_group_byte_sizes_) == num_groups
 
     def test_prefix_sum_monotone(self) -> None:
-        """Per-group byte starts must be strictly increasing under
-        identity byte_layout_order_ (all groups full-attention here)."""
+        """Per-group byte starts must be strictly increasing."""
         ctx = _make_context_multi_group(self.GROUPS_DIFF_DTYPE)
         starts = ctx.tmp_group_byte_starts_
         for i in range(1, len(starts)):

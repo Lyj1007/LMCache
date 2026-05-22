@@ -119,15 +119,10 @@ class GPUCacheContext:
         # single memcpy, without needing to know the per-group layout.
         # max_batch_size is the max number of chunks processed concurrently.
         self.max_batch_size = 4
-        # ------------------------------------------------------------------
-        # Byte layout order: full-attention groups first, SWA groups last.
-        # ``group_idx`` semantics are unchanged (vLLM connector still feeds
-        # data by group_idx). Only the *physical* byte placement within
-        # the tmp_gpu_buffer / MemoryObj.raw_data changes — placing all
-        # full-attention bytes in a contiguous prefix lets retrieve do a
-        # short H2D for non-tail chunks (whose SWA suffix is unused by any
-        # future query under PR #3261's SWA-suffix design).
-        # ------------------------------------------------------------------
+        # Byte layout: full-attention groups first, SWA groups last. This
+        # places all full-attn bytes in a contiguous prefix so the retrieve
+        # path can short-H2D non-tail chunks (whose SWA suffix is unused).
+        # ``group_idx`` semantics are unchanged.
         groups = self.kv_layer_groups_manager_.kv_layer_groups
         self.byte_layout_order_: list[int] = sorted(
             range(len(groups)),
@@ -135,8 +130,7 @@ class GPUCacheContext:
         )
 
         # Per-group byte placement within one chunk slot, indexed by
-        # ``group_idx`` (NOT by ``byte_layout_order_`` position). All
-        # downstream callers index by ``group_idx`` and stay correct.
+        # ``group_idx`` (not by ``byte_layout_order_`` position).
         self.tmp_group_byte_starts_: list[int] = [0] * len(groups)
         self.tmp_group_byte_sizes_: list[int] = [0] * len(groups)
 
@@ -158,10 +152,8 @@ class GPUCacheContext:
                 _first_swa_offset = self.tmp_group_byte_starts_[g_idx]
 
         self.tmp_chunk_bytes_ = cumulative
-        # ``full_attn_bytes_`` is the byte length of the "essential"
-        # prefix (all full-attention groups). When no SWA group exists
-        # this equals ``tmp_chunk_bytes_`` — the entire chunk is
-        # essential and short-read/H2D becomes a no-op.
+        # Byte length of the full-attention prefix. Equals tmp_chunk_bytes_
+        # when no SWA group exists (short-read becomes a no-op).
         self.full_attn_bytes_ = (
             _first_swa_offset
             if _first_swa_offset is not None
@@ -435,35 +427,22 @@ class GPUCacheContext:
         return self.blocks_per_chunk(group_idx) * group.logical_block_size
 
     def has_swa_groups(self) -> bool:
-        """True if any group has ``sliding_window > 0``. Drives whether
-        the short-read/short-H2D optimization for non-tail chunks is
-        applicable. When False, ``full_attn_bytes_ == tmp_chunk_bytes_``
-        and downstream code falls back to the original full-chunk H2D
-        path.
+        """True if any group has ``sliding_window > 0``. When False,
+        ``full_attn_bytes_ == tmp_chunk_bytes_`` and short-H2D is a no-op.
         """
         return self.full_attn_bytes_ < self.tmp_chunk_bytes_
 
     def full_attn_bytes(self) -> int:
         """Per-chunk byte length covering all full-attention groups
-        (= the chunk's "essential" prefix before any SWA suffix).
-
-        For models without SWA groups this equals ``tmp_chunk_bytes_``.
-        Used by the retrieve path to do a short H2D for non-tail chunks
-        whose SWA suffix is provably unused by any future query under
-        PR #3261's SWA-suffix-only design.
+        (= the chunk's prefix before any SWA suffix). Equals
+        ``tmp_chunk_bytes_`` for models without SWA groups.
         """
         return self.full_attn_bytes_
 
     def get_essential_chunk_view(self, chunk_idx: int) -> torch.Tensor:
-        """Returns a uint8 view of just the full-attention prefix of
-        chunk slot ``chunk_idx`` in the tmp GPU buffer.
-
-        Used as the H2D destination when copying only the essential
-        bytes of a non-tail chunk's MemoryObj into the tmp buffer.
-        Length equals ``full_attn_bytes()``; the trailing SWA-suffix
-        region of the slot is left untouched (whatever residual is
-        there is never scattered for non-tail chunks under the
-        retrieve-time SWA-skip rule).
+        """Returns a uint8 view of the full-attention prefix of chunk
+        slot ``chunk_idx`` in the tmp GPU buffer. Used as the H2D
+        destination for short-reads of non-tail chunks.
 
         Args:
             chunk_idx: Chunk index (0 <= chunk_idx < max_batch_size).

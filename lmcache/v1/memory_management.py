@@ -138,20 +138,9 @@ class MemoryObjMetadata:
     shapes: Optional[list[torch.Size]] = None
     dtypes: Optional[list[torch.dtype]] = None
 
-    # Byte length of the "essential" prefix (all full-attention groups)
-    # within this object. ``0`` (the default) means either "no SWA / all
-    # bytes are essential" (fresh allocation under a non-SWA layout) or
-    # "legacy on-disk object without this field" (old caches deserialized
-    # via :meth:`from_dict`). Both interpretations are byte-level
-    # equivalent to the pre-refactor full-read behavior — the retrieve
-    # path treats ``0`` as a sentinel for "do not short-read".
-    #
-    # For SWA-aware allocations this is set after
-    # :class:`MemoryAllocatorInterface.batched_allocate` returns, by
-    # :class:`L1MemoryManager.allocate` reading
-    # :attr:`MemoryLayoutDesc.full_attn_bytes`. Keeping the propagation
-    # in one place avoids threading a new parameter through every
-    # ``batched_allocate`` implementation in the tree.
+    # Byte length of the full-attention prefix in this object. ``0`` means
+    # "no SWA / all bytes essential" (also the legacy default). Set by
+    # :meth:`L1MemoryManager.allocate` from ``MemoryLayoutDesc.full_attn_bytes``.
     full_attn_bytes: int = 0
 
     def to_dict(self):
@@ -191,7 +180,7 @@ class MemoryObjMetadata:
             fmt=MemoryFormat(d["fmt"]),
             shapes=shapes,
             dtypes=dtypes,
-            # Backward-compat: missing key on legacy caches => 0 sentinel.
+            # Backward-compat: missing on legacy caches.
             full_attn_bytes=d.get("full_attn_bytes", 0),
         )
 
