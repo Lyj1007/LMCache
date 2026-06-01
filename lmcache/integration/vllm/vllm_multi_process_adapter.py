@@ -3,6 +3,7 @@
 # Standard
 from dataclasses import dataclass
 from typing import Any
+import enum
 import os
 import threading
 import time
@@ -26,12 +27,79 @@ from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSum
 
 logger = init_logger(__name__)
 
-# Timeout (seconds) for blocking MQ requests: initial chunk-size query,
-# KV cache registration/unregistration, and other synchronous operations.
-DEFAULT_MQ_TIMEOUT: float = 300.0
-# Interval (seconds) between periodic heartbeat pings to the server.
-DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
+class ExtraConfigDefault(enum.Enum):
+    """Centralized default values for extra_config keys.
 
+    Each member's *name* is the key used in the extra_config dict,
+    and its *value* is the default.
+    """
+
+    # Timeout (seconds) for blocking MQ requests: initial
+    # chunk-size query, KV cache registration/unregistration,
+    # and other synchronous operations.
+    mq_timeout = 300.0
+    # Interval (seconds) between periodic heartbeat pings
+    # to the server.
+    heartbeat_interval = 10.0
+
+
+# Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
+# entry point, which still passes these as positional/keyword args.
+DEFAULT_MQ_TIMEOUT: float = ExtraConfigDefault.mq_timeout.value
+DEFAULT_HEARTBEAT_INTERVAL: float = ExtraConfigDefault.heartbeat_interval.value
+
+_EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
+
+
+def _resolve_extra_config(
+    extra_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve extra_config against :class:`ExtraConfigDefault`.
+
+    Keys in *extra_config* are expected to carry the
+    ``lmcache.mp.`` prefix (e.g. ``lmcache.mp.mq_timeout``).
+    The prefix is stripped before matching against
+    :class:`ExtraConfigDefault` members.
+
+    All ``lmcache.mp.*`` entries are logged.  Entries whose
+    value differs from the default are additionally marked as
+    *overridden*.
+
+    Args:
+        extra_config: User-supplied config dict (may be *None*).
+
+    Returns:
+        A dict keyed by :pyattr:`ExtraConfigDefault` member names.
+    """
+    stripped: dict[str, Any] = {}
+    if extra_config is not None:
+        for k, v in extra_config.items():
+            if k.startswith(_EXTRA_CONFIG_KEY_PREFIX):
+                short = k[len(_EXTRA_CONFIG_KEY_PREFIX) :]
+                stripped[short] = v
+
+    resolved: dict[str, Any] = {}
+    for item in ExtraConfigDefault:
+        default = item.value
+        raw = stripped.get(item.name)
+        value = type(default)(raw) if raw is not None else default
+        if value != default:
+            logger.info(
+                "%s%s = %s (overridden, default: %s)",
+                _EXTRA_CONFIG_KEY_PREFIX,
+                item.name,
+                value,
+                default,
+            )
+        else:
+            logger.info(
+                "%s%s = %s",
+                _EXTRA_CONFIG_KEY_PREFIX,
+                item.name,
+                value,
+            )
+        resolved[item.name] = value
+    return resolved
 
 def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
     logger.info("KV caches keys are %s", list(kv_caches.keys()))
@@ -102,33 +170,37 @@ class ParallelStrategy:
     use_mla: bool
     """Whether to use the MLA."""
 
-    kv_world_size: int
-    """
-    The kv world size, kv_world_size may not be equal to the actual_world_size, 
-    in the case of mla, it will 'exclude' the effect of TP, the value is 
-    calculated by `extract_world_size_and_kv_rank` in `lmcache_mp_connector.py`.
-    """
+    global_world_size: int
+    """Total number of vLLM worker processes."""
 
-    kv_worker_id: int
-    """
-    The kv worker id of the sub-process, kv_worker_id may not be equal to the 
-    actual_worker_id, in the case of mla, it will 'exclude' the effect of TP, 
-    the value is calculated by `extract_world_size_and_kv_rank` in 
-    `lmcache_mp_connector.py`.
-    """
-
-    actual_world_size: int
-    """The actual world size."""
-
-    actual_worker_id: int
-    """The actual worker id of the sub-process."""
+    global_rank: int
+    """The current worker's rank in ``[0, global_world_size)``."""
 
     tp_size: int
-    """The tensor parallel size."""
+    """Tensor-parallel size of the model."""
 
     pp_size: int
-    """The pipeline parallel size."""
+    """Pipeline-parallel size of the model."""
 
+    n_servers: int
+    """Number of LMCache servers backing this deployment
+    (1 = single shared server, >1 = one server per node)."""
+
+    kv_world_size: int
+    """How many different pieces the KV cache is split into across the
+    whole deployment."""
+
+    kv_worker_id: int
+    """Which piece of the KV cache the current worker has, in
+    ``[0, kv_world_size)``."""
+
+    local_kv_world_size: int
+    """Same as ``kv_world_size`` but scoped to a single LMCache server;
+    consulted only when ``n_servers > 1``."""
+
+    local_tp_size: int
+    """Same as ``tp_size`` but scoped to a single LMCache server;
+    consulted only when ``n_servers > 1``."""
 
 class HeartbeatThread(PeriodicThread):
     """Periodically checks server health via PING.
@@ -213,7 +285,7 @@ LookupResult = int
 class LMCacheMPSchedulerAdapter:
     def __init__(
         self,
-        server_url: str,
+        server_urls: list[str],
         context: zmq.Context,
         model_name: str,
         vllm_block_size: int,
@@ -221,10 +293,11 @@ class LMCacheMPSchedulerAdapter:
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         save_decode_cache: bool = False,
+        extra_config: dict[str, Any] | None = None,
     ):
         """
         Args:
-            server_url: The server URL for the LMCache message queue
+            server_urls: A list of server URLs for the LMCache message queue
             context: The ZMQ context
             model_name: The model name used for LMCache keys
             vllm_block_size: The block size used in vLLM
@@ -237,19 +310,30 @@ class LMCacheMPSchedulerAdapter:
                 If False (default), store operations are skipped when the
                 request is in decode phase.
         """
-        self.mq_client = MessageQueueClient(server_url, context)
+        assert len(server_urls) >= 1, "At least one server url required"
+        self._server_urls: list[str] = list(server_urls)
+        self.mq_clients: dict[str, MessageQueueClient] = {
+            url: MessageQueueClient(url, context) for url in self._server_urls
+        }
+        if extra_config is not None:
+            cfg = _resolve_extra_config(extra_config)
+            mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
+            heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
         self._mq_timeout = mq_timeout
 
-        # Two-phase lookup state:
-        # - phase 1: request_id -> server prefetch job ID
-        # - phase 2: job_id -> matched chunk count (will be cached)
-        # The cached lookup result will be cleared by `cleanup_lookup_result`
-        self._lookup_job_ids: dict[str, int] = {}
-        self._finished_lookup_jobs: dict[int, int] = {}
+        # Two-phase lookup state (multi-server):
+        # - phase 1: request_ids whose LOOKUP was successfully submitted
+        #   to ALL backing servers (we no longer track a per-server job_id).
+        # - phase 2: request_id -> aggregated matched-token count, cached
+        #   once every server has reported its prefetch status.
+        # Both maps are cleared by `cleanup_lookup_result`.
+        self._lookup_job_ids: set[str] = set()
+        self._finished_lookup_jobs: dict[str, int] = {}
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
         self.save_decode_cache = save_decode_cache
+        self._per_server_hits: dict[str, dict[str, int]] = {}
 
         # Decode phase tracking: request IDs that have entered decode phase.
         # Connectors call mark_decode_phase() to register, and
@@ -257,58 +341,81 @@ class LMCacheMPSchedulerAdapter:
         self._decode_requests: set[str] = set()
 
         # Read chunk size from lmcache
-        try:
-            self.chunk_size = get_lmcache_chunk_size(self.mq_client)
-        except TimeoutError:
-            self.mq_client.close()
-            raise ConnectionError(
-                f"LMCache server did not respond within {mq_timeout}s. "
-                "Is the server running?"
-            ) from None
+        chunk_sizes: dict[str, int] = {}
+        for url, client in self.mq_clients.items():
+            try:
+                chunk_sizes[url] = get_lmcache_chunk_size(client)
+            except TimeoutError:
+                for c in self.mq_clients.values():
+                    c.close()
+                raise ConnectionError(
+                    f"LMCache server {url} did not respond within {mq_timeout}s"
+                ) from None
+
+        # All servers must share chunk_size, otherwise the min() aggregation
+        # over per-server hits would mix different granularities.
+        unique_sizes = set(chunk_sizes.values())
+        assert len(unique_sizes) == 1, (
+            f"All LMCache servers must share the same chunk_size, got {chunk_sizes}"
+        )
+        self.chunk_size = unique_sizes.pop()
         assert self.chunk_size % vllm_block_size == 0, (
             "LMCache chunk size should be a multiple of vLLM block size"
         )
         self.blocks_in_chunk = self.chunk_size // vllm_block_size
 
         # Health state (shared with heartbeat thread)
-        self._health_event = threading.Event()
-        self._health_event.set()
+        self._health_events: dict[str, threading.Event] = {}
+        for url in self._server_urls:
+            ev = threading.Event()
+            ev.set()  # start optimistic; heartbeat will clear on failure
+            self._health_events[url] = ev
 
         # Heartbeat thread is created but NOT started yet.
         # It will be lazily started on the first lookup
         # request, by which time vLLM is fully ready.
         self._heartbeat_interval = heartbeat_interval
-        self._heartbeat: HeartbeatThread | None = None
+        self._heartbeats: dict[str, HeartbeatThread] = {}
         self._heartbeat_lock = threading.Lock()
 
     @property
     def world_size(self) -> int:
         """Get the kv world size."""
+        if not self.parallel_strategy.use_mla and self.parallel_strategy.n_servers > 1:
+            return self.parallel_strategy.local_kv_world_size
         return self.parallel_strategy.kv_world_size
 
     @property
     def tp_size(self) -> int:
         """The tensor parallel size."""
+        if self.parallel_strategy.n_servers > 1:
+            return self.parallel_strategy.local_tp_size
         return self.parallel_strategy.tp_size
 
     @property
     def is_healthy(self) -> bool:
-        """Whether the LMCache server is healthy."""
-        return self._health_event.is_set()
+        """True iff every backing LMCache server is healthy."""
+        return all(ev.is_set() for ev in self._health_events.values())
+
+    def healthy_urls(self) -> list[str]:
+        """Return the list of server URLs that are currently healthy."""
+        return [u for u, ev in self._health_events.items() if ev.is_set()]
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first use."""
-        if self._heartbeat is not None:
+        if self._heartbeats:
             return
         with self._heartbeat_lock:
-            if self._heartbeat is not None:
+            if self._heartbeats:
                 return
-            self._heartbeat = HeartbeatThread(
-                mq_client=self.mq_client,
-                health_event=self._health_event,
-                interval=self._heartbeat_interval,
-            )
-            self._heartbeat.start()
+            for url, client in self.mq_clients.items():
+                hb = HeartbeatThread(
+                    mq_client=client,
+                    health_event=self._health_events[url],
+                    interval=self._heartbeat_interval,
+                )
+                hb.start()
+                self._heartbeats[url] = hb
 
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
@@ -355,22 +462,73 @@ class LMCacheMPSchedulerAdapter:
             end=aligned_end,
             request_id=request_id,
         ).no_worker_id_version()
+        futures: dict[str, MessagingFuture[Any]] = {}
+        for url in self._server_urls:
+            try:
+                futures[url] = send_lmcache_request(
+                    self.mq_clients[url],
+                    RequestType.LOOKUP,
+                    [key, self.tp_size],
+                )
+            except Exception as e:
+                logger.error("LOOKUP submit to %s failed: %s", url, e, exc_info=True)
+                self._health_events[url].clear()
+        results: list[tuple[str, bool]] = []
+        for url, fut in futures.items():
+            try:
+                fut.result(timeout=self._mq_timeout)
+                results.append((url, True))
+            except TimeoutError:
+                logger.warning(
+                    "LOOKUP to %s timed out after %ss; marking unhealthy.",
+                    url,
+                    self._mq_timeout,
+                )
+                self._health_events[url].clear()
+                results.append((url, False))
+            except Exception as e:
+                logger.error("LOOKUP to %s failed: %s", url, e, exc_info=True)
+                self._health_events[url].clear()
+                results.append((url, False))
+        
+        for url in self._server_urls:
+            if url not in futures:
+                results.append((url, False))
 
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.LOOKUP,
-            [key, self.tp_size],
-        )
-        try:
-            job_id = future.result(timeout=self._mq_timeout)
-        except TimeoutError:
-            logger.warning(
-                "LOOKUP request timed out after %ss. Marking server as unhealthy.",
-                self._mq_timeout,
+        if all(ok for _, ok in results):
+            self._lookup_job_ids.add(request_id)
+        else:
+            failed = [u for u, ok in results if not ok]
+            logger.error(
+                "[req=%s] LOOKUP failed on servers %s -- fall back to no-hit",
+                request_id,
+                failed,
             )
-            self._health_event.clear()
-            return
-        self._lookup_job_ids[request_id] = job_id
+            # Best-effort: proactively release the read locks the
+            # *successful* servers have already taken, so we do not
+            # have to wait for server-side GC / TTL.  We reuse the
+            # same key (start=0, end=aligned_end, no_worker_id_version)
+            # as the LOOKUP submitted above.
+            succeeded = [u for u, ok in results if ok]
+            for url in succeeded:
+                client = self.mq_clients.get(url)
+                if client is None:
+                    continue
+                try:
+                    send_lmcache_request(
+                        client,
+                        RequestType.FREE_LOOKUP_LOCKS,
+                        [key, self.tp_size],
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[req=%s] FREE_LOOKUP_LOCKS (partial-fail rollback) "
+                        "to %s failed: %s "
+                        "(rely on server-side GC for any residual lock)",
+                        request_id,
+                        url,
+                        e,
+                    )
 
     @_lmcache_nvtx_annotate
     def check_lookup_result(self, request_id: str) -> int | None:
@@ -395,38 +553,73 @@ class LMCacheMPSchedulerAdapter:
             return 0
 
         if not self.is_healthy:
-            # Server went down — give up on this lookup
-            self._lookup_job_ids.pop(request_id, None)
+            # Some server went down — give up on this lookup
+            self._lookup_job_ids.discard(request_id)
             return 0
 
-        job_id = self._lookup_job_ids[request_id]
+        if request_id in self._finished_lookup_jobs:
+            # Return cached result if every server has already reported
+            return self._finished_lookup_jobs[request_id]
 
-        if job_id in self._finished_lookup_jobs:
-            # Return cached result if the job is already finished
-            return self._finished_lookup_jobs[job_id] * self.chunk_size
+        per_server = self._per_server_hits.setdefault(request_id, {})
+        unresolved_urls = [u for u in self._server_urls if u not in per_server]
 
-        try:
-            result = send_lmcache_request(
-                self.mq_client,
-                RequestType.QUERY_PREFETCH_STATUS,
-                [job_id],
-            ).result(timeout=self._mq_timeout)
-        except TimeoutError:
-            logger.warning(
-                "QUERY_PREFETCH_STATUS timed out after %ss. "
-                "Marking server as unhealthy.",
-                self._mq_timeout,
-            )
-            self._health_event.clear()
-            self._lookup_job_ids.pop(request_id, None)
-            return 0
+        futures: dict[str, MessagingFuture[Any]] = {}
+        for url in unresolved_urls:
+            try:
+                futures[url] = send_lmcache_request(
+                    self.mq_clients[url],
+                    RequestType.QUERY_PREFETCH_STATUS,
+                    [request_id],
+                )
+            except Exception as e:
+                logger.error(
+                    "QUERY_PREFETCH_STATUS submit to %s failed: %s",
+                    url,
+                    e,
+                    exc_info=True,
+                )
+                self._health_events[url].clear()
 
-        if result is None:
+        for url, fut in futures.items():
+            try:
+                r = fut.result(timeout=self._mq_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "QUERY_PREFETCH_STATUS to %s timed out. Marking unhealthy.",
+                    url,
+                )
+                self._health_events[url].clear()
+                continue
+            except Exception as e:
+                logger.error(
+                    "QUERY_PREFETCH_STATUS to %s failed: %s",
+                    url,
+                    e,
+                    exc_info=True,
+                )
+                self._health_events[url].clear()
+                continue
+            if r is None:
+                continue
+            per_server[url] = int(r)
+
+        if len(per_server) < len(self._server_urls):
             return None
 
-        self._finished_lookup_jobs[job_id] = result
+        min_chunks = min(per_server.values())
+        max_chunks = max(per_server.values())
+        if min_chunks != max_chunks:
+            logger.warning(
+                "[req=%s] LMCache hit mismatch across servers: %s → take min=%d",
+                request_id,
+                dict(per_server),
+                min_chunks,
+            )
 
-        return result * self.chunk_size
+        token_count = min_chunks * self.chunk_size
+        self._finished_lookup_jobs[request_id] = token_count
+        return token_count
 
     def num_blocks_per_chunk(self) -> int:
         """
@@ -441,9 +634,17 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the finished request.
         """
-        job_id = self._lookup_job_ids.pop(request_id, None)
-        if job_id is not None:
-            self._finished_lookup_jobs.pop(job_id, None)
+        self._lookup_job_ids.discard(request_id)
+        self._finished_lookup_jobs.pop(request_id, None)
+        self._per_server_hits.pop(request_id, None)
+
+    def shutdown(self) -> None:
+        """Shutdown the scheduler adapter and its resources."""
+        for client in self.mq_clients.values():
+            client.close()
+        with self._heartbeat_lock:
+            for hb in self._heartbeats.values():
+                hb.stop()
 
     def mark_decode_phase(self, request_id: str) -> None:
         """Mark a request as having entered the decode phase.
@@ -526,14 +727,71 @@ class LMCacheMPSchedulerAdapter:
         if not self.is_healthy:
             return
 
-        key = self._create_key(
-            token_ids, start=start, end=end, request_id=request_id
+        base_key = self._create_key(
+            token_ids,
+            start=start,
+            end=end,
+            request_id=request_id,
         ).no_worker_id_version()
-        send_lmcache_request(
-            self.mq_client,
-            RequestType.FREE_LOOKUP_LOCKS,
-            [key, self.tp_size],
-        )
+        for url in self._server_urls:
+            client = self.mq_clients.get(url)
+            if client is None:
+                continue
+            try:
+                send_lmcache_request(
+                    client,
+                    RequestType.FREE_LOOKUP_LOCKS,
+                    [base_key, self.tp_size],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[req=%s] FREE_LOOKUP_LOCKS to %s failed: %s "
+                    "(rely on server-side GC for any residual lock)",
+                    request_id,
+                    url,
+                    e,
+                )
+
+    def free_per_server_overhit_locks(
+        self,
+        token_ids: list[int],
+        request_id: str,
+    ) -> None:
+        """Release the per-server tail locks that exceed the global min hit."""
+        if not self.is_healthy:
+            return
+        per_server = self._per_server_hits.get(request_id)
+        if not per_server:
+            return
+        min_hit_chunks = min(per_server.values())
+        min_hit_end = min_hit_chunks * self.chunk_size
+        for url, hit_chunks in per_server.items():
+            if hit_chunks <= min_hit_chunks:
+                continue
+            tail_end = min(hit_chunks * self.chunk_size, len(token_ids))
+            tail_key = self._create_key(
+                token_ids=token_ids,
+                start=min_hit_end,
+                end=tail_end,
+                request_id=request_id,
+            ).no_worker_id_version()
+            client = self.mq_clients.get(url)
+            if client is None:
+                continue
+            try:
+                send_lmcache_request(
+                    client,
+                    RequestType.FREE_LOOKUP_LOCKS,
+                    [tail_key, self.tp_size],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[req=%s] FREE_LOOKUP_LOCKS (tail) to %s failed: %s "
+                    "(rely on server-side GC for any residual lock)",
+                    request_id,
+                    url,
+                    e,
+                )
 
     def end_session(self, request_id: str) -> None:
         """
@@ -544,11 +802,12 @@ class LMCacheMPSchedulerAdapter:
         if not self.is_healthy:
             return
 
-        send_lmcache_request(
-            self.mq_client,
-            RequestType.END_SESSION,
-            [request_id],
-        )
+        for url in self.healthy_urls():
+            send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.END_SESSION,
+                [request_id],
+            )
 
     def report_block_allocations(
         self,
@@ -566,11 +825,12 @@ class LMCacheMPSchedulerAdapter:
         if not self.is_healthy or not records:
             return
 
-        send_lmcache_request(
-            self.mq_client,
-            RequestType.REPORT_BLOCK_ALLOCATION,
-            [records],
-        )
+        for url in self.healthy_urls():
+            send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.REPORT_BLOCK_ALLOCATION,
+                [os.getpid(), self.model_name, records],
+            )
 
     # Helper functions
     def _create_key(
@@ -636,26 +896,78 @@ class LMCacheMPSyncLookUpSchedulerAdapter(LMCacheMPSchedulerAdapter):
             request_id=request_id,
         ).no_worker_id_version()
 
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.SYNC_LOOKUP,
-            [key, self.tp_size],
-        )
-        try:
-            hit_chunks = future.result(timeout=self._mq_timeout)
-        except TimeoutError:
-            logger.warning(
-                "SYNC_LOOKUP request timed out after %ss. Marking server as unhealthy.",
-                self._mq_timeout,
+        # Multi-server: fan out SYNC_LOOKUP to every backing LMCache
+        # server and take the minimum hit, mirroring the async
+        # LOOKUP + QUERY_PREFETCH_STATUS path on the parent class.
+        futures: dict[str, MessagingFuture[Any]] = {}
+        for url in self._server_urls:
+            try:
+                futures[url] = send_lmcache_request(
+                    self.mq_clients[url],
+                    RequestType.SYNC_LOOKUP,
+                    [key, self.tp_size],
+                )
+            except Exception as e:
+                logger.error(
+                    "SYNC_LOOKUP submit to %s failed: %s",
+                    url,
+                    e,
+                    exc_info=True,
+                )
+                self._health_events[url].clear()
+
+        per_server: dict[str, int] = {}
+        for url, fut in futures.items():
+            try:
+                per_server[url] = int(fut.result(timeout=self._mq_timeout))
+            except TimeoutError:
+                logger.warning(
+                    "SYNC_LOOKUP to %s timed out after %ss. "
+                    "Marking server as unhealthy.",
+                    url,
+                    self._mq_timeout,
+                )
+                self._health_events[url].clear()
+            except Exception as e:
+                logger.error(
+                    "SYNC_LOOKUP to %s failed: %s",
+                    url,
+                    e,
+                    exc_info=True,
+                )
+                self._health_events[url].clear()
+
+        # If any server failed to report, fall back to no-hit so that we
+        # never retrieve from a partially-available prefix.
+        if len(per_server) < len(self._server_urls):
+            failed = [u for u in self._server_urls if u not in per_server]
+            logger.error(
+                "[req=%s] SYNC_LOOKUP failed on servers %s -- fall back to no-hit",
+                request_id,
+                failed,
             )
-            self._health_event.clear()
             return 0
 
-        hit_tokens = hit_chunks * self.chunk_size
+        min_chunks = min(per_server.values())
+        max_chunks = max(per_server.values())
+        if min_chunks != max_chunks:
+            logger.warning(
+                "[req=%s] LMCache hit mismatch across servers: %s → take min=%d",
+                request_id,
+                dict(per_server),
+                min_chunks,
+            )
+
+        # Cache per-server hits so that `free_per_server_overhit_locks`
+        # can later release tail locks held by servers whose hit
+        # exceeded the global min.
+        self._per_server_hits[request_id] = per_server
+
+        hit_tokens = min_chunks * self.chunk_size
         logger.debug(
             "SYNC_LOOKUP: request_id=%s hit %d chunks (%d tokens)",
             request_id,
-            hit_chunks,
+            min_chunks,
             hit_tokens,
         )
         return hit_tokens
@@ -673,8 +985,13 @@ class LMCacheMPWorkerAdapter:
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         save_decode_cache: bool = False,
         sync_mode: bool = False,
+        extra_config: dict[str, Any] | None = None,
     ):
         self.mq_client = MessageQueueClient(server_url, context)
+        if extra_config is not None:
+            cfg = _resolve_extra_config(extra_config)
+            mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
+            heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
         self._mq_timeout = mq_timeout
         self.sync_mode = sync_mode
 
@@ -753,12 +1070,21 @@ class LMCacheMPWorkerAdapter:
 
     @property
     def world_size(self) -> int:
-        """Get the kv world size."""
+        """How many pieces the KV cache is split into across the LMCache
+        server this worker talks to."""
+        if not self.parallel_strategy.use_mla and self.parallel_strategy.n_servers > 1:
+            return self.parallel_strategy.local_kv_world_size
         return self.parallel_strategy.kv_world_size
 
     @property
     def worker_id(self) -> int:
-        """Get the kv worker id."""
+        """This worker's piece index, in ``[0, world_size)``.
+        Unique among workers backing the same LMCache server."""
+        if not self.parallel_strategy.use_mla and self.parallel_strategy.n_servers > 1:
+            return (
+                self.parallel_strategy.global_rank
+                % self.parallel_strategy.local_kv_world_size
+            )
         return self.parallel_strategy.kv_worker_id
 
     @property
@@ -768,11 +1094,19 @@ class LMCacheMPWorkerAdapter:
 
     @property
     def is_first_rank_of_pp_group(self) -> bool:
-        """Is the first rank of the pipeline parallel group."""
-        return (
-            self.parallel_strategy.actual_worker_id % self.parallel_strategy.tp_size
-            == 0
-        )
+        """Whether this worker is the first rank of its pipeline-parallel
+        group. Use ``is_first_rank_of_node`` for per-node STORE gating."""
+        return self.parallel_strategy.global_rank % self.parallel_strategy.tp_size == 0
+
+    @property
+    def is_first_rank_of_node(self) -> bool:
+        """Whether this worker is the first rank on its node. Use
+        ``is_first_rank_of_pp_group`` outside multi-server deployments."""
+        n_servers = self.parallel_strategy.n_servers
+        if n_servers <= 1:
+            return self.is_first_rank_of_pp_group
+        ranks_per_node = self.parallel_strategy.global_world_size // n_servers
+        return self.parallel_strategy.global_rank % ranks_per_node == 0
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
