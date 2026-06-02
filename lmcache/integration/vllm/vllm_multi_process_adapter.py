@@ -769,7 +769,34 @@ class LMCacheMPSchedulerAdapter:
         token_ids: list[int],
         request_id: str,
     ) -> None:
-        """Release the per-server tail locks that exceed the global min hit."""
+        """Release the per-server tail locks that exceed the global min hit.
+
+        When the multi-server LOOKUP returns mismatched hit counts (e.g.
+        one server hits 39 chunks while another hits 0 because it was
+        recently cleared), the over-hit tail on the leading server(s)
+        not only holds stale read locks but also prevents subsequent
+        prefill+store cycles from repopulating the lagging server: the
+        leading server keeps reporting hits, ``min`` keeps returning a
+        non-equal pair (or 0), and the cluster never re-aligns.
+
+        To break that loop we both:
+
+        1. ``FREE_LOOKUP_LOCKS`` over ``[min_hit_end, tail_end)``  --
+           release the read locks acquired during LOOKUP;
+        2. ``DELETE_CHUNKS`` over the same range  --  evict the actual
+           cached data so the next LOOKUP on this prefix returns the
+           same (smaller) hit count on every server, allowing vLLM to
+           run a normal prefill+store and refill the lagging server.
+
+        Steps 1 and 2 are sent to the SAME ``MessageQueueClient`` so
+        they are processed in order on the server side; any chunk that
+        is still locked when ``DELETE_CHUNKS`` runs is silently skipped
+        by the server.
+
+        This method is a no-op for healthy / fully consistent hits
+        because the inner loop's ``hit_chunks <= min_hit_chunks``
+        ``continue`` filters them out.
+        """
         if not self.is_healthy:
             return
         per_server = self._per_server_hits.get(request_id)
@@ -796,9 +823,32 @@ class LMCacheMPSchedulerAdapter:
                     RequestType.FREE_LOOKUP_LOCKS,
                     [tail_key, self.tp_size],
                 )
+                # Mismatch repair: also evict the over-hit chunks so
+                # the next LOOKUP sees an aligned cache state across
+                # all servers and a normal prefill+store can refill
+                # the lagging server.  The server processes this
+                # AFTER the FREE_LOOKUP_LOCKS above (same client, same
+                # ZMQ socket -> in-order delivery); locked chunks are
+                # silently skipped on the server side.
+                send_lmcache_request(
+                    client,
+                    RequestType.DELETE_CHUNKS,
+                    [tail_key, self.tp_size],
+                )
+                logger.info(
+                    "[req=%s] mismatch repair on %s: freed+deleted "
+                    "tail chunks tokens[%d-%d) (server hit=%d, "
+                    "global min=%d)",
+                    request_id,
+                    url,
+                    min_hit_end,
+                    tail_end,
+                    hit_chunks,
+                    min_hit_chunks,
+                )
             except Exception as e:
                 logger.warning(
-                    "[req=%s] FREE_LOOKUP_LOCKS (tail) to %s failed: %s "
+                    "[req=%s] FREE+DELETE (tail) to %s failed: %s "
                     "(rely on server-side GC for any residual lock)",
                     request_id,
                     url,

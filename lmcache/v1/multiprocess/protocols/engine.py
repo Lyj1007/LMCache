@@ -32,6 +32,7 @@ REQUEST_NAMES = [
     "QUERY_PREFETCH_LOOKUP_HITS",
     "QUERY_PREFETCH_STATUS_WITH_REQ_ID",
     "FREE_LOOKUP_LOCKS",
+    "DELETE_CHUNKS",
     "END_SESSION",
 ]
 
@@ -143,6 +144,25 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #       MLA multi-reader locking
         # Returns: None
         "FREE_LOOKUP_LOCKS": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=None,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Force-evict the chunks identified by the cache key from L1.
+        # Used by the multi-server scheduler adapter to repair hit
+        # mismatch: when one server reports more chunks than another,
+        # the over-hit tail on the leading server(s) is deleted so
+        # that subsequent LOOKUPs on the same prefix return a
+        # consistent (aligned) hit count across all servers.
+        # Caller MUST send FREE_LOOKUP_LOCKS for the same range first;
+        # any chunk still under read/write lock is silently skipped.
+        # Payload:
+        #   - key: KeyType - Cache key whose chunks to delete
+        #   - tp_size: int - Tensor-parallel size for
+        #       MLA multi-reader locking (kept for symmetry with
+        #       FREE_LOOKUP_LOCKS; not used for delete itself)
+        # Returns: None
+        "DELETE_CHUNKS": ProtocolDefinition(
             payload_classes=[KeyType, int],
             response_class=None,
             handler_type=HandlerType.BLOCKING,

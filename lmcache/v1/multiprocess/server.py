@@ -1036,6 +1036,45 @@ class MPCacheEngine:
 
         self.storage_manager.finish_read_prefetched(obj_keys, extra_count=extra_count)
 
+    def delete_chunks(
+        self,
+        key: IPCCacheEngineKey,
+        tp_size: int,
+    ) -> None:
+        """Force-evict the chunks identified by ``key`` from L1 cache.
+
+        Used by the multi-server scheduler adapter to repair hit
+        mismatch: when one LMCache server reports more matched chunks
+        than another for the same prefix, the over-hit tail on the
+        leading server is deleted so that subsequent LOOKUPs return a
+        consistent (aligned) hit count across all backing servers.
+
+        Best-effort semantics: chunks that are still under read or
+        write lock are silently skipped (see :meth:`L1Manager.delete`).
+        Caller is expected to issue ``FREE_LOOKUP_LOCKS`` for the same
+        ``[start, end)`` range first so that the read locks acquired
+        during ``LOOKUP`` are released before this call.
+
+        Hashes are computed only for chunks in ``[start, end)``;
+        ``start``/``end`` must be aligned to the chunk size (caller
+        responsibility, same as :meth:`free_lookup_locks`).
+
+        Args:
+            key: Cache key whose chunks should be deleted.
+            tp_size: Tensor-parallel size for MLA multi-reader
+                locking.  Currently unused for delete itself but
+                kept for protocol symmetry with FREE_LOOKUP_LOCKS
+                so that callers can reuse the same key/tp_size pair.
+        """
+        del tp_size  # reserved for future use; symmetry with free_lookup_locks
+        chunk_hashes = self.token_hasher.compute_chunk_hashes(
+            list(key.token_ids), start=key.start, end=key.end
+        )
+        if not chunk_hashes:
+            return
+        obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+        self.storage_manager.delete(obj_keys)
+
     # =========================================================================
     # Utility methods
     # =========================================================================
@@ -1525,6 +1564,7 @@ def run_cache_server(
         engine.query_prefetch_lookup_hits,
     )
     add_handler_helper(server, RequestType.FREE_LOOKUP_LOCKS, engine.free_lookup_locks)
+    add_handler_helper(server, RequestType.DELETE_CHUNKS, engine.delete_chunks)
     add_handler_helper(
         server,
         RequestType.QUERY_PREFETCH_STATUS_WITH_REQ_ID,
@@ -1555,6 +1595,7 @@ def run_cache_server(
             RequestType.QUERY_PREFETCH_LOOKUP_HITS,
             RequestType.QUERY_PREFETCH_STATUS_WITH_REQ_ID,
             RequestType.FREE_LOOKUP_LOCKS,
+            RequestType.DELETE_CHUNKS,
             RequestType.END_SESSION,
             RequestType.CLEAR,
             RequestType.PING,

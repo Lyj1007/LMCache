@@ -481,6 +481,20 @@ class StorageManager:
         """
         self._l1_manager.touch_keys(keys)
 
+    def delete(self, keys: list[ObjectKey]) -> None:
+        """Delete the given keys from L1 storage.
+
+        Best-effort: keys that are still locked or do not exist are
+        silently skipped (see :meth:`L1Manager.delete` for the
+        per-key error semantics).  This is intended for explicit
+        cache invalidation (e.g. multi-server hit-mismatch repair),
+        NOT for normal eviction which is handled by the controllers.
+
+        Args:
+            keys: List of object keys to delete.
+        """
+        self._l1_manager.delete(keys)
+
     def clear(self, force: bool = False):
         """
         Clear data in the storage manager.
