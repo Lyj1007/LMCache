@@ -27,6 +27,7 @@ from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSum
 
 logger = init_logger(__name__)
 
+
 class ExtraConfigDefault(enum.Enum):
     """Centralized default values for extra_config keys.
 
@@ -100,6 +101,7 @@ def _resolve_extra_config(
             )
         resolved[item.name] = value
     return resolved
+
 
 def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
     logger.info("KV caches keys are %s", list(kv_caches.keys()))
@@ -201,6 +203,7 @@ class ParallelStrategy:
     local_tp_size: int
     """Same as ``tp_size`` but scoped to a single LMCache server;
     consulted only when ``n_servers > 1``."""
+
 
 class HeartbeatThread(PeriodicThread):
     """Periodically checks server health via PING.
@@ -490,7 +493,7 @@ class LMCacheMPSchedulerAdapter:
                 logger.error("LOOKUP to %s failed: %s", url, e, exc_info=True)
                 self._health_events[url].clear()
                 results.append((url, False))
-        
+
         for url in self._server_urls:
             if url not in futures:
                 results.append((url, False))
@@ -535,9 +538,9 @@ class LMCacheMPSchedulerAdapter:
         """
         Check the result of a previously submitted lookup request.
 
-        Sends a QUERY_PREFETCH_STATUS request to the server and blocks
-        until the server responds.  Returns the matched token count
-        when the prefetch is complete, or None if still in progress.
+        Sends a QUERY_PREFETCH_STATUS_WITH_REQ_ID request to the server
+        and blocks until the server responds.  Returns the matched token
+        count when the prefetch is complete, or None if still in progress.
 
         Args:
             request_id: The ID of the lookup request submitted in
@@ -569,12 +572,12 @@ class LMCacheMPSchedulerAdapter:
             try:
                 futures[url] = send_lmcache_request(
                     self.mq_clients[url],
-                    RequestType.QUERY_PREFETCH_STATUS,
+                    RequestType.QUERY_PREFETCH_STATUS_WITH_REQ_ID,
                     [request_id],
                 )
             except Exception as e:
                 logger.error(
-                    "QUERY_PREFETCH_STATUS submit to %s failed: %s",
+                    "QUERY_PREFETCH_STATUS_WITH_REQ_ID submit to %s failed: %s",
                     url,
                     e,
                     exc_info=True,
@@ -586,14 +589,15 @@ class LMCacheMPSchedulerAdapter:
                 r = fut.result(timeout=self._mq_timeout)
             except TimeoutError:
                 logger.warning(
-                    "QUERY_PREFETCH_STATUS to %s timed out. Marking unhealthy.",
+                    "QUERY_PREFETCH_STATUS_WITH_REQ_ID to %s timed out. "
+                    "Marking unhealthy.",
                     url,
                 )
                 self._health_events[url].clear()
                 continue
             except Exception as e:
                 logger.error(
-                    "QUERY_PREFETCH_STATUS to %s failed: %s",
+                    "QUERY_PREFETCH_STATUS_WITH_REQ_ID to %s failed: %s",
                     url,
                     e,
                     exc_info=True,

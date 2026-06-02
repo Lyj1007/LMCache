@@ -1309,3 +1309,8 @@ class LMCacheMPConnectorDynamic(KVConnectorBase_V1):
                 "[KVConnector] Cleaned up request_tracker for request %s",
                 request_id,
             )
+
+
+# Backward-compatible alias: vLLM may be configured with kv_connector name
+# "LMCacheMPConnector". Map it to the actual implementation class.
+LMCacheMPConnector = LMCacheMPConnectorDynamic
