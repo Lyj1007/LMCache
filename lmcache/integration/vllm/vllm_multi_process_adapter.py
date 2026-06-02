@@ -325,12 +325,12 @@ class LMCacheMPSchedulerAdapter:
         self._mq_timeout = mq_timeout
 
         # Two-phase lookup state (multi-server):
-        # - phase 1: request_ids whose LOOKUP was successfully submitted
-        #   to ALL backing servers (we no longer track a per-server job_id).
+        # - phase 1: request_id -> {server_url: per-server prefetch job_id},
+        #   populated only when LOOKUP succeeded on ALL backing servers.
         # - phase 2: request_id -> aggregated matched-token count, cached
         #   once every server has reported its prefetch status.
         # Both maps are cleared by `cleanup_lookup_result`.
-        self._lookup_job_ids: set[str] = set()
+        self._lookup_job_ids: dict[str, dict[str, int]] = {}
         self._finished_lookup_jobs: dict[str, int] = {}
 
         self.model_name = model_name
@@ -477,9 +477,11 @@ class LMCacheMPSchedulerAdapter:
                 logger.error("LOOKUP submit to %s failed: %s", url, e, exc_info=True)
                 self._health_events[url].clear()
         results: list[tuple[str, bool]] = []
+        per_server_job_ids: dict[str, int] = {}
         for url, fut in futures.items():
             try:
-                fut.result(timeout=self._mq_timeout)
+                job_id = fut.result(timeout=self._mq_timeout)
+                per_server_job_ids[url] = int(job_id)
                 results.append((url, True))
             except TimeoutError:
                 logger.warning(
@@ -499,7 +501,7 @@ class LMCacheMPSchedulerAdapter:
                 results.append((url, False))
 
         if all(ok for _, ok in results):
-            self._lookup_job_ids.add(request_id)
+            self._lookup_job_ids[request_id] = per_server_job_ids
         else:
             failed = [u for u, ok in results if not ok]
             logger.error(
@@ -557,7 +559,7 @@ class LMCacheMPSchedulerAdapter:
 
         if not self.is_healthy:
             # Some server went down — give up on this lookup
-            self._lookup_job_ids.discard(request_id)
+            self._lookup_job_ids.pop(request_id, None)
             return 0
 
         if request_id in self._finished_lookup_jobs:
@@ -565,19 +567,26 @@ class LMCacheMPSchedulerAdapter:
             return self._finished_lookup_jobs[request_id]
 
         per_server = self._per_server_hits.setdefault(request_id, {})
+        per_server_job_ids = self._lookup_job_ids[request_id]
         unresolved_urls = [u for u in self._server_urls if u not in per_server]
 
         futures: dict[str, MessagingFuture[Any]] = {}
         for url in unresolved_urls:
+            job_id = per_server_job_ids.get(url)
+            if job_id is None:
+                # Should not happen because we only populate
+                # _lookup_job_ids when ALL servers succeeded, but be
+                # defensive: skip and let the caller retry next tick.
+                continue
             try:
                 futures[url] = send_lmcache_request(
                     self.mq_clients[url],
-                    RequestType.QUERY_PREFETCH_STATUS_WITH_REQ_ID,
-                    [request_id],
+                    RequestType.QUERY_PREFETCH_STATUS,
+                    [job_id],
                 )
             except Exception as e:
                 logger.error(
-                    "QUERY_PREFETCH_STATUS_WITH_REQ_ID submit to %s failed: %s",
+                    "QUERY_PREFETCH_STATUS submit to %s failed: %s",
                     url,
                     e,
                     exc_info=True,
@@ -589,15 +598,14 @@ class LMCacheMPSchedulerAdapter:
                 r = fut.result(timeout=self._mq_timeout)
             except TimeoutError:
                 logger.warning(
-                    "QUERY_PREFETCH_STATUS_WITH_REQ_ID to %s timed out. "
-                    "Marking unhealthy.",
+                    "QUERY_PREFETCH_STATUS to %s timed out. Marking unhealthy.",
                     url,
                 )
                 self._health_events[url].clear()
                 continue
             except Exception as e:
                 logger.error(
-                    "QUERY_PREFETCH_STATUS_WITH_REQ_ID to %s failed: %s",
+                    "QUERY_PREFETCH_STATUS to %s failed: %s",
                     url,
                     e,
                     exc_info=True,
@@ -638,7 +646,7 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the finished request.
         """
-        self._lookup_job_ids.discard(request_id)
+        self._lookup_job_ids.pop(request_id, None)
         self._finished_lookup_jobs.pop(request_id, None)
         self._per_server_hits.pop(request_id, None)
 
