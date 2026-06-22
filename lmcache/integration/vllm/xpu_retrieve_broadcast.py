@@ -295,6 +295,8 @@ class XpuRetrieveBroadcaster:
                     item.request_id,
                     item.group_id,
                 )
+                if not is_src:
+                    raise  # PR5b: broadcast is the only data path for peers
 
     def _drive_source(
         self, item: _PendingBroadcast, mq_timeout: float

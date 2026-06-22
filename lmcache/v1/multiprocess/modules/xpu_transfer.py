@@ -268,6 +268,8 @@ class XpuInstanceEntry:
     layer_page_sizes_per_group: list[list[int]] = field(default_factory=list)
     max_page_size_per_group: list[int] = field(default_factory=list)
     staging_buffer: Optional[torch.Tensor] = None
+    # Pre-allocated device buffer for block_ids to avoid per-call allocation.
+    block_ids_buffer: Optional[torch.Tensor] = None
 
 
 class XpuTransferModule:
@@ -574,6 +576,7 @@ class XpuTransferModule:
                 layer_page_sizes_per_group,
                 max_page_size_per_group,
                 staging_buffer,
+                block_ids_buffer,
             ) = self._build_kernel_metadata(
                 remote_layer_tensors, payload.groups, payload.layer_handles, device
             )
@@ -596,6 +599,7 @@ class XpuTransferModule:
                 layer_page_sizes_per_group=layer_page_sizes_per_group,
                 max_page_size_per_group=max_page_size_per_group,
                 staging_buffer=staging_buffer,
+                block_ids_buffer=block_ids_buffer,
             )
             self._instances[payload.instance_id] = entry
 
@@ -770,6 +774,17 @@ class XpuTransferModule:
                 max_staging_bytes, dtype=torch.int8, device=device
             )
 
+        # Pre-allocate block_ids buffer sized to max blocks_per_chunk.
+        max_bpc = max(
+            (g.blocks_per_chunk for g in groups if g.group_id in per_group_layers),
+            default=0,
+        )
+        block_ids_buffer: Optional[torch.Tensor] = None
+        if max_bpc > 0:
+            block_ids_buffer = torch.empty(
+                max_bpc, dtype=torch.int64, device=device
+            )
+
         return (
             group_layer_tensors_int8,
             layers_scalars_tensors,
@@ -777,6 +792,7 @@ class XpuTransferModule:
             layer_page_sizes_per_group,
             max_page_size_per_group,
             staging_buffer,
+            block_ids_buffer,
         )
 
     def unregister_xpu_kv_cache(self, instance_id: int) -> None:
@@ -903,9 +919,14 @@ class XpuTransferModule:
             page_sizes = entry.layer_page_sizes_per_group[gi]
             n_blocks = len(group_block_ids)
 
-            block_ids_dev = torch.tensor(
-                group_block_ids, dtype=torch.int64, device=entry.device
-            )
+            # Reuse pre-allocated block_ids buffer
+            if entry.block_ids_buffer is not None and n_blocks <= entry.block_ids_buffer.numel():
+                block_ids_dev = entry.block_ids_buffer[:n_blocks]
+                block_ids_dev.copy_(torch.tensor(group_block_ids, dtype=torch.int64))
+            else:
+                block_ids_dev = torch.tensor(
+                    group_block_ids, dtype=torch.int64, device=entry.device
+                )
             staging_view = entry.staging_buffer[:nl * n_blocks * max_page].view(
                 nl, n_blocks, max_page
             )
@@ -924,16 +945,27 @@ class XpuTransferModule:
             if dst_tensor is not None:
                 dst_flat = dst_tensor.view(-1)
                 total_bytes = sum(ps * n_blocks for ps in page_sizes)
-                compact_buf = torch.empty(total_bytes, dtype=torch.int8, device=entry.device)
-                dev_offset = 0
-                for li in range(nl):
-                    ps = page_sizes[li]
-                    nbytes = n_blocks * ps
-                    compact_buf[dev_offset:dev_offset + nbytes].copy_(
-                        staging_view[li, :n_blocks, :ps].contiguous().view(-1)
+                # Fast path: uniform page sizes → staging is already
+                # contiguous and layout-aligned with host flat tensor.
+                if all(ps == max_page for ps in page_sizes):
+                    dst_flat[:total_bytes].copy_(
+                        staging_view[:nl, :n_blocks, :max_page].view(-1)[:total_bytes],
+                        non_blocking=True,
                     )
-                    dev_offset += nbytes
-                dst_flat[:total_bytes].copy_(compact_buf)
+                else:
+                    # Slow path: gather per-layer slices into compact buf.
+                    compact_buf = torch.empty(
+                        total_bytes, dtype=torch.int8, device=entry.device
+                    )
+                    dev_offset = 0
+                    for li in range(nl):
+                        ps = page_sizes[li]
+                        nbytes = n_blocks * ps
+                        compact_buf[dev_offset:dev_offset + nbytes].copy_(
+                            staging_view[li, :n_blocks, :ps].contiguous().view(-1)
+                        )
+                        dev_offset += nbytes
+                    dst_flat[:total_bytes].copy_(compact_buf)
 
     @_lmcache_nvtx_annotate
     def retrieve_xpu(
@@ -1042,20 +1074,32 @@ class XpuTransferModule:
             if src_tensor is None:
                 continue
             src_flat = src_tensor.view(-1)
-            # Direct H2D from host-registered SHM into staging buffer,
-            # avoiding intermediate clone() + to() allocations.
-            dev_offset = 0
-            for li in range(nl):
-                ps = page_sizes[li]
-                nbytes = n_blocks * ps
-                staging_view[li, :n_blocks, :ps].reshape(-1).copy_(
-                    src_flat[dev_offset:dev_offset + nbytes], non_blocking=True
+            total_bytes = sum(ps * n_blocks for ps in page_sizes)
+            # Fast path: all layers have the same page size, so host flat
+            # layout matches staging layout exactly → single bulk H2D copy.
+            if all(ps == max_page for ps in page_sizes):
+                staging_view[:nl, :n_blocks, :max_page].view(-1)[:total_bytes].copy_(
+                    src_flat[:total_bytes], non_blocking=True
                 )
-                dev_offset += nbytes
+            else:
+                # Slow path: per-layer copy for heterogeneous page sizes.
+                dev_offset = 0
+                for li in range(nl):
+                    ps = page_sizes[li]
+                    nbytes = n_blocks * ps
+                    staging_view[li, :n_blocks, :ps].contiguous().view(-1).copy_(
+                        src_flat[dev_offset:dev_offset + nbytes], non_blocking=True
+                    )
+                    dev_offset += nbytes
 
-            block_ids_dev = torch.tensor(
-                group_block_ids, dtype=torch.int64, device=entry.device
-            )
+            # Reuse pre-allocated block_ids buffer
+            if entry.block_ids_buffer is not None and n_blocks <= entry.block_ids_buffer.numel():
+                block_ids_dev = entry.block_ids_buffer[:n_blocks]
+                block_ids_dev.copy_(torch.tensor(group_block_ids, dtype=torch.int64))
+            else:
+                block_ids_dev = torch.tensor(
+                    group_block_ids, dtype=torch.int64, device=entry.device
+                )
             skip_n = 0
             if chunk_idx == 0 and gi < len(skip_blocks_per_group):
                 skip_n = skip_blocks_per_group[gi]

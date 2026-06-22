@@ -549,7 +549,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             the same.
 
         """
-        # B2: drain pending broadcasts before submitting new retrieves
+        # B2: drain pending broadcasts (PR5b: required for correctness)
         if getattr(self, '_broadcaster', None) is not None:
             self._broadcaster.drain_pending(self.worker_adapter._mq_timeout)
 
@@ -573,9 +573,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         event = torch_dev.Event(interprocess=self._use_interprocess_events)
         event.record()
 
-        self.worker_adapter.batched_submit_retrieve_requests(
-            request_ids, ops, event, cache_salts=cache_salts
-        )
+        # PR5b: peer ranks skip server retrieve entirely (all groups MLA)
+        if (getattr(self, '_broadcaster', None) is not None
+                and not self._broadcaster.coordinator.is_broadcast_source()):
+            # Track request_ids so get_finished can report them as done
+            if not hasattr(self, '_peer_pending_retrieve_ids'):
+                self._peer_pending_retrieve_ids: set[str] = set()
+            self._peer_pending_retrieve_ids.update(request_ids)
+        else:
+            self.worker_adapter.batched_submit_retrieve_requests(
+                request_ids, ops, event, cache_salts=cache_salts
+            )
 
         # B3: enqueue broadcast for MLA groups after submit
         if getattr(self, '_broadcaster', None) is not None:
@@ -724,7 +732,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             call to this method (this call or a prior one).
         """
         val = self.worker_adapter.get_finished(finished_req_ids)
-        # logger.error("Finished req ids: %s, %s", val[0], val[1])
+        # PR5b: peer ranks that skip retrieve have no retrieve_futures.
+        # We must report pending retrieve request_ids as finished after
+        # broadcast drain completes, so vLLM unblocks deferred requests.
+        if (getattr(self, '_broadcaster', None) is not None
+                and not self._broadcaster.coordinator.is_broadcast_source()):
+            stores = val[0] if val[0] is not None else set()
+            retrieves = val[1] if val[1] is not None else set()
+            pending = getattr(self, '_peer_pending_retrieve_ids', set())
+            retrieves = retrieves | pending
+            self._peer_pending_retrieve_ids = set()
+            return stores, retrieves
         return val
 
     def get_block_ids_with_load_errors(self) -> set[int]:
