@@ -1258,6 +1258,8 @@ class LMCacheMPWorkerAdapter:
         transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
         layout_hints = vllm_layout_hints()
         self.transfer_ctx = transfer_ctx
+        tp_size = self.parallel_strategy.tp_size
+        tp_rank = self.parallel_strategy.actual_worker_id % tp_size
         try:
             # Register on the local, not self.transfer_ctx: a concurrent
             # shutdown() may null self.transfer_ctx between publish and this
@@ -1274,6 +1276,8 @@ class LMCacheMPWorkerAdapter:
                 layout_hints=layout_hints,
                 engine_group_infos=self.engine_group_infos,
                 engine_type=EngineType.VLLM,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
             )
         except TimeoutError:
             raise ConnectionError(

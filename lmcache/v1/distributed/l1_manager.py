@@ -843,6 +843,11 @@ class L1Manager:
         """Return an L1MemoryDesc describing the underlying L1 memory buffer."""
         return self._memory_manager.get_l1_memory_desc()
 
+    @property
+    def memory_allocator(self) -> "L1MemoryManager":
+        """Expose the memory manager for XPU SHM host-registration."""
+        return self._memory_manager
+
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
         with self._lock:

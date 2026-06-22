@@ -218,6 +218,10 @@ class L1MemoryManager:
             align_bytes=self._align_bytes,
         )
 
+    def get_base_ptr(self) -> int:
+        """Return the base pointer of the L1 memory buffer."""
+        return self.get_l1_memory_desc().ptr
+
     def close(self) -> None:
         """
         Close the memory manager and release all resources.

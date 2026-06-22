@@ -40,7 +40,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.utils import init_logger
+from lmcache.utils import EngineType, init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints, is_mla
 from lmcache.v1.multiprocess.custom_types import (
     RegisterXpuContextPayload,
@@ -49,7 +49,7 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import (
-    LMCacheGroupView,
+    EngineGroupInfo,
     get_engine_group_indices,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -124,7 +124,7 @@ class _BgRequest:
 
 def _build_layer_handles(
     kv_caches: dict[str, torch.Tensor],
-    group_views: Sequence[LMCacheGroupView],
+    group_views: Sequence[EngineGroupInfo],
 ) -> list[XpuLayerHandle]:
     """Build cross-process layer-pointer descriptors from worker KV caches.
 
@@ -165,7 +165,7 @@ def _build_layer_handles(
 
 
 def _build_group_views(
-    group_views: Sequence[LMCacheGroupView],
+    group_views: Sequence[EngineGroupInfo],
     layout_hints: LayoutHints | None,
     block_size: int,
     blocks_in_chunk: int,
@@ -329,7 +329,8 @@ class XPUDevicePtrTransferContext(TransferContext):
         mq_timeout: float,
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
-        group_views: Sequence[LMCacheGroupView] = (),
+        engine_group_infos: Sequence[EngineGroupInfo] = (),
+        engine_type: EngineType = EngineType.VLLM,
         tp_rank: int = 0,
         tp_size: int = 1,
         l1_pool_request_size: int = 0,
@@ -351,7 +352,10 @@ class XPUDevicePtrTransferContext(TransferContext):
             mq_timeout: Timeout in seconds for synchronous request waits.
             send_request: Request sender callable used to issue MQ requests.
             layout_hints: Inference-engine-provided layout hints.
-            group_views: LMCache-owned engine KV cache group metadata.
+            engine_group_infos: LMCache-owned engine KV cache group metadata.
+            engine_type: Serving engine that produced the caches. Accepted
+                to satisfy the base interface; the XPU device-pointer path
+                carries layer pointers directly and does not branch on it.
             tp_rank: TP rank of this worker within the inference engine
                 TP group. Defaults to ``0`` when callers don't track TP.
             tp_size: TP size of the inference engine TP group. Defaults
@@ -366,6 +370,7 @@ class XPUDevicePtrTransferContext(TransferContext):
             ValueError: If ``tp_rank`` is outside ``[0, tp_size)`` or
                 ``tp_size`` is non-positive.
         """
+        del engine_type  # unused: the XPU path ships raw layer pointers
         if not kv_caches:
             raise RuntimeError("XPU transfer context requires non-empty kv_caches")
         if int(tp_size) <= 0:
@@ -391,9 +396,9 @@ class XPUDevicePtrTransferContext(TransferContext):
             )
             use_mla_global = is_mla(gpu_kv_format)
 
-            layer_handles = _build_layer_handles(kv_caches, group_views)
+            layer_handles = _build_layer_handles(kv_caches, engine_group_infos)
             groups = _build_group_views(
-                group_views,
+                engine_group_infos,
                 layout_hints,
                 block_size=block_size,
                 blocks_in_chunk=blocks_in_chunk,

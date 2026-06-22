@@ -223,6 +223,8 @@ class TransferContext(ABC):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
+        tp_rank: int = 0,
+        tp_size: int = 1,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -242,6 +244,12 @@ class TransferContext(ABC):
                 own :class:`EngineType` so this transport stays engine-
                 neutral. Defaults to :attr:`EngineType.VLLM` for
                 backwards compatibility.
+            tp_rank: TP rank of this worker inside the inference-engine TP
+                group. Only consumed by the XPU device-pointer path, which
+                needs it to pick the MLA broadcast source; other contexts
+                ignore it.
+            tp_size: Size of the inference-engine TP group. Same ownership
+                as ``tp_rank``.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -425,6 +433,8 @@ class LMCacheDrivenTransferContext(TransferContext):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
+        tp_rank: int = 0,
+        tp_size: int = 1,
     ) -> None:
         """Register the worker KV cache with the LMCache server.
 
@@ -440,11 +450,14 @@ class LMCacheDrivenTransferContext(TransferContext):
             layout_hints: Optional KV-layout metadata.
             engine_group_infos: Optional engine KV-group metadata.
             engine_type: Serving engine that produced the caches.
+            tp_rank: Accepted to satisfy the base interface; no-op here.
+            tp_size: Accepted to satisfy the base interface; no-op here.
 
         Raises:
             RuntimeError: If event IPC is unsupported for the KV-cache device.
             ValueError: If ``kv_caches`` is empty.
         """
+        del tp_rank, tp_size  # only the XPU device-pointer path uses these
         device = _get_kv_device(kv_caches)
         event_backend = get_event_ipc_backend(device)
         event_backend.check_event_support(device)
@@ -669,6 +682,8 @@ class EngineDrivenTransferContext(TransferContext):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
+        tp_rank: int = 0,
+        tp_size: int = 1,
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
@@ -676,9 +691,11 @@ class EngineDrivenTransferContext(TransferContext):
         the base interface but are currently a no-op: the non-GPU transfer
         path does not support hybrid KV cache groups and rejects multi-
         group transfers at store / retrieve time (see
-        ``_single_group_block_ids``).
+        ``_single_group_block_ids``).  ``tp_rank`` / ``tp_size`` are
+        likewise inert here; only the XPU device-pointer path reads them.
         """
         del engine_type  # unused on the engine-driven path
+        del tp_rank, tp_size  # only the XPU device-pointer path uses these
         # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
         # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
         # on the CUDA path. The non-CUDA path is yet to be implemented.

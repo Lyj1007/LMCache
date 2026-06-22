@@ -162,29 +162,58 @@ def _layout_desc_from_groups(
 ) -> MemoryLayoutDesc:
     """Build a per-group ``MemoryLayoutDesc`` describing the chunk shape.
 
+    Each group's MemoryObj slot must hold the full multi-layer gathered
+    data: ``sum(page_bytes_per_layer) * blocks_per_chunk`` bytes. We use
+    int8 dtype with a 1-D shape to represent raw byte storage.
+
     Args:
         groups: Per-group metadata reported by the worker.
-        layer_handles: Layer handles, used to resolve per-group dtype.
+        layer_handles: Layer handles, used to compute per-block byte width.
 
     Returns:
         A :class:`MemoryLayoutDesc` covering all groups in ``groups`` order.
     """
-    # Pick first layer dtype per group; all layers in a group share dtype.
-    group_to_dtype: dict[int, torch.dtype] = {}
+    # Compute per-group total page bytes (sum across layers).
+    group_page_bytes: dict[int, int] = {}
     for h in layer_handles:
-        if h.group_id not in group_to_dtype:
-            group_to_dtype[h.group_id] = _resolve_dtype(h.dtype_str)
+        shape = tuple(h.shape)
+        num_blocks = shape[0]
+        numel = 1
+        for s in shape:
+            numel *= int(s)
+        elem_size = torch.tensor([], dtype=_resolve_dtype(h.dtype_str)).element_size()
+        page_bytes = (numel // num_blocks) * elem_size
+        group_page_bytes[h.group_id] = group_page_bytes.get(h.group_id, 0) + page_bytes
 
     shapes: list[torch.Size] = []
     dtypes: list[torch.dtype] = []
     for g in groups:
-        # Use a flattened per-chunk shape: chunk holds ``blocks_per_chunk``
-        # paged blocks of ``block_size`` tokens. The actual hidden dim is
-        # encoded by the layer-handle shape; the layout desc only needs to
-        # carry chunk-sized buffers for the L1 manager.
-        shapes.append(torch.Size([g.blocks_per_chunk, g.block_size]))
-        dtypes.append(group_to_dtype.get(g.group_id, torch.float16))
+        total_bytes = group_page_bytes.get(g.group_id, 0) * g.blocks_per_chunk
+        shapes.append(torch.Size([total_bytes]))
+        dtypes.append(torch.int8)
     return MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
+
+
+def _load_xvllm_ops():
+    """Load xvllm gather/scatter ops with graceful fallback.
+
+    Returns:
+        Tuple of (gather_fn, scatter_fn) or (None, None) if unavailable.
+    """
+    try:
+        import vllm_xpu._C  # noqa: F401
+    except ImportError:
+        logger.info("vllm_xpu._C not importable; gather/scatter disabled.")
+        return None, None
+    g = getattr(torch.ops._C, "gather_multi_layer_block_kv_transfer", None)
+    s = getattr(torch.ops._C, "scatter_multi_layer_block_kv_transfer", None)
+    if g is None or s is None:
+        logger.warning("gather/scatter ops not found in torch.ops._C")
+        return None, None
+    return g, s
+
+
+_gather_op, _scatter_op = _load_xvllm_ops()
 
 
 @dataclass
@@ -211,6 +240,12 @@ class XpuInstanceEntry:
         store_lock: Serializes store-stream submissions for this instance.
         retrieve_lock: Serializes retrieve-stream submissions for this
             instance.
+        group_layer_tensors_int8: Per-group int8-viewed remote tensors.
+        layers_scalars_tensors: Per-group int32 device tensor of page sizes.
+        paged_buffer_ptrs_devs: Per-group int64 device tensor of data ptrs.
+        layer_page_sizes_per_group: Per-group list of page sizes in bytes.
+        max_page_size_per_group: Per-group max page size.
+        staging_buffer: Device int8 buffer for gather/scatter staging.
     """
 
     remote_layer_tensors: list[torch.Tensor]
@@ -226,6 +261,13 @@ class XpuInstanceEntry:
     local_device_buffer: Optional[torch.Tensor] = None
     store_lock: threading.Lock = field(default_factory=threading.Lock)
     retrieve_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Kernel cached state (populated at registration for gather/scatter)
+    group_layer_tensors_int8: list[list[torch.Tensor]] = field(default_factory=list)
+    layers_scalars_tensors: list[torch.Tensor] = field(default_factory=list)
+    paged_buffer_ptrs_devs: list[torch.Tensor] = field(default_factory=list)
+    layer_page_sizes_per_group: list[list[int]] = field(default_factory=list)
+    max_page_size_per_group: list[int] = field(default_factory=list)
+    staging_buffer: Optional[torch.Tensor] = None
 
 
 class XpuTransferModule:
@@ -524,6 +566,18 @@ class XpuTransferModule:
                 payload.groups, payload.layer_handles
             )
 
+            # Build per-group kernel metadata for gather/scatter
+            (
+                group_layer_tensors_int8,
+                layers_scalars_tensors,
+                paged_buffer_ptrs_devs,
+                layer_page_sizes_per_group,
+                max_page_size_per_group,
+                staging_buffer,
+            ) = self._build_kernel_metadata(
+                remote_layer_tensors, payload.groups, payload.layer_handles, device
+            )
+
             entry = XpuInstanceEntry(
                 remote_layer_tensors=remote_layer_tensors,
                 groups=list(payload.groups),
@@ -536,6 +590,12 @@ class XpuTransferModule:
                 broadcast_buffer_bytes=broadcast_buffer_bytes,
                 device=device,
                 local_device_buffer=local_device_buffer,
+                group_layer_tensors_int8=group_layer_tensors_int8,
+                layers_scalars_tensors=layers_scalars_tensors,
+                paged_buffer_ptrs_devs=paged_buffer_ptrs_devs,
+                layer_page_sizes_per_group=layer_page_sizes_per_group,
+                max_page_size_per_group=max_page_size_per_group,
+                staging_buffer=staging_buffer,
             )
             self._instances[payload.instance_id] = entry
 
@@ -627,6 +687,97 @@ class XpuTransferModule:
             if payload_bytes > max_bytes:
                 max_bytes = payload_bytes
         return max_bytes
+
+    @staticmethod
+    def _build_kernel_metadata(
+        remote_layer_tensors: list[torch.Tensor],
+        groups: list[XpuGroupView],
+        layer_handles: list[XpuLayerHandle],
+        device: torch.device,
+    ) -> tuple[
+        list[list[torch.Tensor]],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[list[int]],
+        list[int],
+        Optional[torch.Tensor],
+    ]:
+        """Build per-group kernel metadata for gather/scatter ops.
+
+        Returns:
+            Tuple of (group_layer_tensors_int8, layers_scalars_tensors,
+            paged_buffer_ptrs_devs, layer_page_sizes_per_group,
+            max_page_size_per_group, staging_buffer).
+        """
+        if _gather_op is None and _scatter_op is None:
+            return [], [], [], [], [], None
+
+        # Group layers by group_id
+        per_group_layers: dict[int, list[torch.Tensor]] = {}
+        group_order: list[int] = []
+        for g in groups:
+            per_group_layers[g.group_id] = []
+            group_order.append(g.group_id)
+        for idx, handle in enumerate(layer_handles):
+            per_group_layers[handle.group_id].append(remote_layer_tensors[idx])
+
+        group_layer_tensors_int8: list[list[torch.Tensor]] = []
+        layers_scalars_tensors: list[torch.Tensor] = []
+        paged_buffer_ptrs_devs: list[torch.Tensor] = []
+        layer_page_sizes_per_group: list[list[int]] = []
+        max_page_size_per_group: list[int] = []
+
+        max_staging_bytes = 0
+        for gid in group_order:
+            tensors = per_group_layers[gid]
+            # int8 view each tensor as [num_blocks, page_bytes]
+            int8_tensors: list[torch.Tensor] = []
+            page_sizes: list[int] = []
+            for t in tensors:
+                flat = t.view(torch.int8)
+                num_blocks = int(t.shape[0])
+                page_bytes = flat.numel() // num_blocks
+                int8_t = flat.view(num_blocks, page_bytes)
+                int8_tensors.append(int8_t)
+                page_sizes.append(page_bytes)
+            group_layer_tensors_int8.append(int8_tensors)
+            layer_page_sizes_per_group.append(page_sizes)
+            max_page = max(page_sizes) if page_sizes else 0
+            max_page_size_per_group.append(max_page)
+
+            nl = len(int8_tensors)
+            # Scalars tensor (page sizes per layer)
+            scalars = torch.tensor(page_sizes, dtype=torch.int32, device=device)
+            layers_scalars_tensors.append(scalars)
+            # Pre-staged device pointer table
+            ptrs = torch.tensor(
+                [int(t.data_ptr()) for t in int8_tensors],
+                dtype=torch.int64, device=device,
+            )
+            paged_buffer_ptrs_devs.append(ptrs)
+
+            # Track max staging needed
+            bpc = next(
+                (g.blocks_per_chunk for g in groups if g.group_id == gid), 0
+            )
+            needed = nl * bpc * max_page
+            if needed > max_staging_bytes:
+                max_staging_bytes = needed
+
+        staging_buffer: Optional[torch.Tensor] = None
+        if max_staging_bytes > 0:
+            staging_buffer = torch.empty(
+                max_staging_bytes, dtype=torch.int8, device=device
+            )
+
+        return (
+            group_layer_tensors_int8,
+            layers_scalars_tensors,
+            paged_buffer_ptrs_devs,
+            layer_page_sizes_per_group,
+            max_page_size_per_group,
+            staging_buffer,
+        )
 
     def unregister_xpu_kv_cache(self, instance_id: int) -> None:
         """Unregister an XPU instance and release its remote-tensor views.
@@ -733,27 +884,56 @@ class XpuTransferModule:
     ) -> None:
         """D2H copy one chunk's KV data from peer device pointers into SHM.
 
-        Implementation note: each LMCache group has its own paged-block
-        layout, so the gather is driven per group. The peer-process
-        ``data_ptr()``-backed remote tensor views feed the cross-process
-        D2D kernel, which lands in ``entry.local_device_buffer`` (when
-        present), and the result is then memcpy'd D2H into the
-        :class:`MemoryObj` slot (XPU offload v2 §9.2).
-
         Args:
             entry: Registered XPU instance metadata.
             chunk_idx: Index into ``obj_keys`` (chunk position).
             block_ids: Per-group paged block ids (full request).
             memory_obj: Destination L1 SHM-backed memory slot.
         """
-        # Defer the actual transfer to ``lmc_ops.multi_layer_block_kv_transfer``
-        # at the c_ops layer once the worker-side gather kernel is available
-        # for XPU. The current scaffolding loops over groups without issuing
-        # the transfer call so that protocol-level wiring can be exercised
-        # before the kernel binding lands. The cross-process kernel
-        # invocation is intentionally left as a no-op stub here — see
-        # design doc §9 for the expected call shape.
-        del entry, chunk_idx, block_ids, memory_obj
+        if _gather_op is None or entry.staging_buffer is None:
+            return
+        num_groups = len(entry.groups)
+        for gi in range(num_groups):
+            bpc = entry.groups[gi].blocks_per_chunk
+            chunk_start = chunk_idx * bpc
+            chunk_end = chunk_start + bpc
+            group_block_ids = block_ids[gi][chunk_start:chunk_end]
+            nl = len(entry.group_layer_tensors_int8[gi])
+            max_page = entry.max_page_size_per_group[gi]
+            page_sizes = entry.layer_page_sizes_per_group[gi]
+            n_blocks = len(group_block_ids)
+
+            block_ids_dev = torch.tensor(
+                group_block_ids, dtype=torch.int64, device=entry.device
+            )
+            staging_view = entry.staging_buffer[:nl * n_blocks * max_page].view(
+                nl, n_blocks, max_page
+            )
+            _gather_op(
+                entry.group_layer_tensors_int8[gi],
+                staging_view,
+                block_ids_dev,
+                page_sizes,
+                max_page,
+                entry.layers_scalars_tensors[gi],
+                paged_buffer_ptrs_dev=entry.paged_buffer_ptrs_devs[gi],
+            )
+
+            # Copy staging → host MemoryObj per-group tensor
+            dst_tensor = memory_obj.get_tensor(gi)
+            if dst_tensor is not None:
+                dst_flat = dst_tensor.view(-1)
+                total_bytes = sum(ps * n_blocks for ps in page_sizes)
+                compact_buf = torch.empty(total_bytes, dtype=torch.int8, device=entry.device)
+                dev_offset = 0
+                for li in range(nl):
+                    ps = page_sizes[li]
+                    nbytes = n_blocks * ps
+                    compact_buf[dev_offset:dev_offset + nbytes].copy_(
+                        staging_view[li, :n_blocks, :ps].contiguous().view(-1)
+                    )
+                    dev_offset += nbytes
+                dst_flat[:total_bytes].copy_(compact_buf)
 
     @_lmcache_nvtx_annotate
     def retrieve_xpu(
@@ -834,10 +1014,6 @@ class XpuTransferModule:
     ) -> None:
         """H2D copy one chunk's KV data from SHM back to peer device pointers.
 
-        Mirror of :meth:`_copy_chunk_to_memory_obj` for the retrieve path
-        (XPU offload v2 §9.3). The cross-process scatter kernel binding is
-        deferred to the worker-side kernel landing.
-
         Args:
             entry: Registered XPU instance metadata.
             chunk_idx: Index into ``obj_keys`` (chunk position).
@@ -845,10 +1021,54 @@ class XpuTransferModule:
             memory_obj: Source L1 SHM-backed memory slot.
             skip_blocks_per_group: APC overlap guard, applied to chunk 0.
         """
-        del entry, chunk_idx, block_ids, memory_obj, skip_blocks_per_group
+        if _scatter_op is None or entry.staging_buffer is None:
+            return
+        num_groups = len(entry.groups)
+        for gi in range(num_groups):
+            bpc = entry.groups[gi].blocks_per_chunk
+            chunk_start = chunk_idx * bpc
+            chunk_end = chunk_start + bpc
+            group_block_ids = block_ids[gi][chunk_start:chunk_end]
+            nl = len(entry.group_layer_tensors_int8[gi])
+            max_page = entry.max_page_size_per_group[gi]
+            page_sizes = entry.layer_page_sizes_per_group[gi]
+            n_blocks = len(group_block_ids)
 
+            # Copy host MemoryObj per-group tensor → staging buffer (H2D)
+            src_tensor = memory_obj.get_tensor(gi)
+            staging_view = entry.staging_buffer[:nl * n_blocks * max_page].view(
+                nl, n_blocks, max_page
+            )
+            if src_tensor is None:
+                continue
+            src_flat = src_tensor.view(-1)
+            # Direct H2D from host-registered SHM into staging buffer,
+            # avoiding intermediate clone() + to() allocations.
+            dev_offset = 0
+            for li in range(nl):
+                ps = page_sizes[li]
+                nbytes = n_blocks * ps
+                staging_view[li, :n_blocks, :ps].reshape(-1).copy_(
+                    src_flat[dev_offset:dev_offset + nbytes], non_blocking=True
+                )
+                dev_offset += nbytes
 
-# Quiet unused-import warnings until the c_ops scatter/gather binding lands;
-# both are referenced in the design doc and will be wired up alongside the
-# worker-side XPU gather/scatter kernel in a follow-up commit.
+            block_ids_dev = torch.tensor(
+                group_block_ids, dtype=torch.int64, device=entry.device
+            )
+            skip_n = 0
+            if chunk_idx == 0 and gi < len(skip_blocks_per_group):
+                skip_n = skip_blocks_per_group[gi]
+            _scatter_op(
+                entry.group_layer_tensors_int8[gi],
+                staging_view,
+                block_ids_dev,
+                page_sizes,
+                max_page,
+                entry.layers_scalars_tensors[gi],
+                skip_prefix_n_blocks=skip_n,
+                paged_buffer_ptrs_dev=entry.paged_buffer_ptrs_devs[gi],
+            )
+        torch_dev.synchronize(entry.device)
+
 _ = (lmc_ops, lmcache_memcpy_async_d2h, lmcache_memcpy_async_h2d)

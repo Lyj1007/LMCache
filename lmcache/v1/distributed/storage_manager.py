@@ -773,6 +773,11 @@ class StorageManager:
         return good_keys, good_objs
 
     @property
+    def l1_manager(self) -> "L1Manager":
+        """Expose the L1 manager for XPU SHM host-registration."""
+        return self._l1_manager
+
+    @property
     def quota_manager(self) -> QuotaManager:
         """Per-cache_salt quota registry.
 

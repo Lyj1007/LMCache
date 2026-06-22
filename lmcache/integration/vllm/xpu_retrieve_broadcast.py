@@ -46,7 +46,7 @@ import torch
 # First Party
 from lmcache.utils import init_logger
 from lmcache.v1.multiprocess.group_view import (
-    LMCacheGroupView,
+    EngineGroupInfo,
     get_engine_group_indices,
 )
 from lmcache.v1.multiprocess.transfer_context.xpu_broadcast import (
@@ -73,7 +73,7 @@ def is_mla_broadcast_enabled() -> bool:
         ``True`` if the env var is set to a truthy value (``"1"``,
         ``"true"`` case-insensitive); ``False`` otherwise.
     """
-    raw = os.environ.get(_ENV_FLAG_NAME, "0")
+    raw = os.environ.get(_ENV_FLAG_NAME, "1")
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -481,7 +481,7 @@ def supports_paged_buffer_ptrs_dev_kwarg(
 def build_group_buffers(
     coordinator: XpuBroadcastCoordinator,
     kv_caches: dict[str, torch.Tensor],
-    group_views: Sequence[LMCacheGroupView],
+    group_views: Sequence[EngineGroupInfo],
     mla_group_ids: Sequence[int],
     blocks_per_chunk: int,
     device: torch.device,

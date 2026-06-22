@@ -497,7 +497,10 @@ chunk 顺序调 `broadcast()`。connector 由 vLLM scheduler 在所有 rank 上�
 4 GiB 段 host-register）：
 
 1. L1 pool 创建为 POSIX SHM + `mmap(MAP_SHARED)`
-2. `madvise(MADV_HUGEPAGE)` + 范围预 fault
+2. `prctl(PR_SET_THP_DISABLE, 0)` + `madvise(MADV_HUGEPAGE)` + 全段
+   `memset` 预 fault（**注意：5.15 tmpfs 上 stride 1 字节首触不能拿到大页**，
+   必须 prctl 解禁进程级 THP + 全段 memset；详见
+   [`shm_hugepage_enablement.md`](./shm_hugepage_enablement.md)）
 3. 按 4 GiB 段 `cudaHostRegister`，初始化期间一次性完成
 4. 失败回滚已注册段 + 启动失败
 

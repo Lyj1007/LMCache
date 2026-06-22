@@ -67,9 +67,16 @@ _MADV_HUGEPAGE = 14
 # hugepage to drive THP collapse synchronously at allocation time.
 _HUGEPAGE_STRIDE = 2 * 1024 * 1024
 
+# prctl(2) option to control per-process Transparent Huge Pages. A process
+# can inherit ``PR_SET_THP_DISABLE=1`` from systemd / docker / a parent
+# shell, which makes ``madvise(MADV_HUGEPAGE)`` a no-op even when the
+# system policy is ``always`` and the tmpfs mount has ``huge=always``.
+# Resetting it to 0 re-enables THP for the current process.
+_PR_SET_THP_DISABLE = 41
+
 
 def _get_libc() -> Optional[ctypes.CDLL]:
-    """Lazily load and cache libc.so.6 for madvise() calls."""
+    """Lazily load and cache libc.so.6 for madvise() / prctl() calls."""
     global _libc
     if _libc is _LIBC_NOT_LOADED:
         try:
@@ -81,29 +88,57 @@ def _get_libc() -> Optional[ctypes.CDLL]:
                 ctypes.c_int,
             ]
             _libc.madvise.restype = ctypes.c_int
+            # int prctl(int option, unsigned long arg2..arg5);
+            _libc.prctl.argtypes = [
+                ctypes.c_int,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+            ]
+            _libc.prctl.restype = ctypes.c_int
         except OSError:
             _libc = None
     return _libc
 
 
 def _advise_thp_and_first_touch(ptr: int, size: int) -> bool:
-    """Apply madvise(MADV_HUGEPAGE) and 2 MiB-stride first-touch.
+    """Apply prctl(PR_SET_THP_DISABLE, 0) + madvise(MADV_HUGEPAGE) + full
+    prefault to force tmpfs hugepage allocation at allocation time.
 
     Args:
         ptr: Base virtual address of the region.
-        size: Region size in bytes. The first-touch walk is bounded by
-            ``size``; THP collapse only succeeds for whole 2 MiB-aligned
-            sub-ranges, so unaligned tails simply remain on 4 KiB pages.
+        size: Region size in bytes. The region must be 2 MiB-aligned for
+            the kernel to honor THP collapse on the entire range; an
+            unaligned tail will silently remain on 4 KiB pages.
 
     Returns:
         True if ``madvise`` returned 0, False otherwise (e.g. libc could
         not be loaded or the kernel rejected the advice). On False the
         caller should still consider the region usable; it just will not
         be THP-backed.
+
+    Implementation notes:
+        Verified via ``probe_shm_thp_variants.py`` on Linux 5.15 with
+        ``/dev/shm`` mounted ``huge=always`` and
+        ``shmem_enabled=always``: only the prctl(THP_DISABLE=0) +
+        ``memset(addr, 0, size)`` combination drives ``ShmemPmdMapped``
+        equal to the segment size. Stride-1-byte first-touch leaves
+        ``ShmemPmdMapped == 0`` because individual 2 MiB candidates do
+        not get collapsed without khugepaged scanning them, and
+        ``khugepaged`` does not run on ``MAP_SHARED`` tmpfs vmas in this
+        kernel. ``prctl(PR_SET_THP_DISABLE, 0)`` is required because the
+        process may inherit ``THP_enabled=0`` from systemd / docker; in
+        that case ``madvise(MADV_HUGEPAGE)`` succeeds (advice attaches
+        as ``hg`` in VmFlags) but the fault path still allocates 4 KiB
+        pages.
     """
     libc = _get_libc()
     if libc is None or size == 0:
         return False
+    # Re-enable THP at the process level, defensively. Errors are
+    # non-fatal: the worst case is the legacy 4 KiB-page behavior.
+    libc.prctl(_PR_SET_THP_DISABLE, 0, 0, 0, 0)
     rc = libc.madvise(ctypes.c_void_p(ptr), ctypes.c_size_t(size), _MADV_HUGEPAGE)
     if rc != 0:
         # errno is per-thread; reading it via ctypes.get_errno is safe here.
@@ -114,22 +149,13 @@ def _advise_thp_and_first_touch(ptr: int, size: int) -> bool:
             stacklevel=2,
         )
         return False
-    # 2 MiB-stride first-touch: write one byte per 2 MiB to fault each
-    # candidate hugepage. Use ctypes pointer arithmetic to avoid creating
-    # any Python-level bytes object.
-    base = ctypes.c_void_p(ptr)
-    one = ctypes.c_uint8(0)
-    off = 0
-    while off < size:
-        ctypes.memmove(
-            ctypes.c_void_p(ptr + off),
-            ctypes.byref(one),
-            1,
-        )
-        off += _HUGEPAGE_STRIDE
-    # Reference base to silence linters; the variable exists to keep the
-    # ``c_void_p`` alive across the loop in case ctypes optimizes it away.
-    _ = base
+    # Full prefault: write every byte so each fault hits the tmpfs huge
+    # path and synchronously allocates a 2 MiB page. Stride-1-byte writes
+    # do NOT trigger huge fault on Linux 5.15 tmpfs (verified offline);
+    # ``ShmemPmdMapped`` stays at 0 in that case. ``ctypes.memset`` is a
+    # single libc call so it is cheap relative to the subsequent
+    # ``host_register`` walk.
+    ctypes.memset(ctypes.c_void_p(ptr), 0, ctypes.c_size_t(size))
     return True
 
 

@@ -479,7 +479,60 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 kv_cache_config=kv_cache_config,
                 vllm_config=self._vllm_config,
             )
+
+        # Lazily init MLA broadcast (Part B1)
+        self._broadcaster = None
+        if is_kunlun_xpu():
+            self._init_mla_broadcaster(kv_caches, engine_group_infos)
         return
+
+    def _init_mla_broadcaster(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        engine_group_infos,
+    ) -> None:
+        """Lazily initialize the MLA TP broadcast bridge if enabled."""
+        try:
+            from lmcache.integration.vllm.xpu_retrieve_broadcast import (
+                is_mla_broadcast_enabled,
+                load_xvllm_gather_scatter,
+                build_group_buffers,
+                XpuRetrieveBroadcaster,
+            )
+        except ImportError:
+            return
+        if not is_mla_broadcast_enabled():
+            return
+        transfer_ctx = self.worker_adapter.transfer_ctx
+        if transfer_ctx is None:
+            return
+        from vllm.distributed.parallel_state import get_tp_group
+        coordinator = transfer_ctx.make_broadcast_coordinator(
+            broadcast_fn=get_tp_group().broadcast
+        )
+        if coordinator is None:
+            return
+        ops = load_xvllm_gather_scatter()
+        if ops is None:
+            return
+        from lmcache import torch_device_type
+        device = torch.device(
+            f"{torch_device_type}:{torch_dev.current_device()}"
+        )
+        buffers = build_group_buffers(
+            coordinator, kv_caches, engine_group_infos,
+            transfer_ctx.mla_group_ids,
+            self.worker_adapter.blocks_in_chunk, device,
+        )
+        if not buffers:
+            return
+        self._broadcaster = XpuRetrieveBroadcaster(
+            coordinator, buffers, ops[0], ops[1], device
+        )
+        logger.info(
+            "MLA broadcast wiring enabled for groups %s",
+            list(buffers.keys()),
+        )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
@@ -496,6 +549,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             the same.
 
         """
+        # B2: drain pending broadcasts before submitting new retrieves
+        if getattr(self, '_broadcaster', None) is not None:
+            self._broadcaster.drain_pending(self.worker_adapter._mq_timeout)
+
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
 
@@ -519,6 +576,35 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self.worker_adapter.batched_submit_retrieve_requests(
             request_ids, ops, event, cache_salts=cache_salts
         )
+
+        # B3: enqueue broadcast for MLA groups after submit
+        if getattr(self, '_broadcaster', None) is not None:
+            self._enqueue_mla_broadcasts(request_ids, ops)
+
+    def _enqueue_mla_broadcasts(
+        self, request_ids: list[str], ops: list["LoadStoreOp"]
+    ) -> None:
+        """Enqueue MLA broadcasts for each retrieve op's MLA groups."""
+        bpc = self.worker_adapter.blocks_in_chunk
+        for request_id, op in zip(request_ids, ops):
+            # Get per-group block_ids in LMCache order
+            block_ids_per_group = self.worker_adapter._block_ids_per_group(op)
+            future_pair = self.worker_adapter.retrieve_futures.get(request_id)
+            future = future_pair[0] if future_pair else None
+            for gi, group_block_ids in enumerate(block_ids_per_group):
+                gviews = self.worker_adapter.group_views
+                if gi < len(gviews):
+                    group_id = gviews[gi].engine_group_id
+                else:
+                    continue
+                if not self._broadcaster.has_group(group_id):
+                    continue
+                # Split into per-chunk slices to respect max_blocks
+                for start in range(0, len(group_block_ids), bpc):
+                    chunk_ids = group_block_ids[start:start + bpc]
+                    self._broadcaster.enqueue_after_submit(
+                        request_id, group_id, chunk_ids, future
+                    )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
