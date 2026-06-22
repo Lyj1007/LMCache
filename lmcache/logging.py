@@ -81,12 +81,21 @@ def init_logger(name: str) -> Logger:
     logger.addHandler(ch)
 
     # OTel log forwarding (no-op if opentelemetry is not installed or
-    # no LoggerProvider has been configured at startup)
+    # no LoggerProvider has been configured at startup).
+    #
+    # NOTE: opentelemetry's default global LoggerProvider is a
+    # ``ProxyLoggerProvider`` whose ``ProxyLogger`` instances lack the
+    # ``resource`` attribute that ``LoggingHandler._translate`` reads,
+    # so attaching the handler unconditionally raises ``AttributeError``
+    # on the very first log record. Gate the attach behind an explicit
+    # check that a real SDK ``LoggerProvider`` has been registered.
     try:
         # Third Party
-        from opentelemetry.sdk._logs import LoggingHandler
+        from opentelemetry._logs import get_logger_provider
+        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
 
-        logger.addHandler(LoggingHandler(level=log_level))
+        if isinstance(get_logger_provider(), LoggerProvider):
+            logger.addHandler(LoggingHandler(level=log_level))
     except ImportError:
         pass
 

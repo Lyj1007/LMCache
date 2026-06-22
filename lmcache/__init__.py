@@ -21,7 +21,28 @@ except ImportError:
 
 logger = init_logger(__name__)
 
-__all__ = ["__version__", "torch_dev", "torch_device_type"]
+__all__ = ["__version__", "torch_dev", "torch_device_type", "is_kunlun_xpu"]
+
+
+def is_kunlun_xpu() -> bool:
+    """Detect whether the current environment is Kunlun XPU with xmlir.
+
+    On Kunlun XPU, ``torch_xmlir`` is loaded and provides CUDA API
+    compatibility, so ``torch.cuda.is_available()`` reports True even
+    though the underlying hardware is XPU. The XPU offload path uses
+    this flag to pick the XPU-specific transfer context (see
+    ``docs/design/v1/multiprocess/xpu_offload_v2_design.md`` §6).
+
+    Returns:
+        True when ``torch_xmlir`` can be imported, False otherwise.
+    """
+    try:
+        # Third Party
+        import torch_xmlir  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 # --------------------------

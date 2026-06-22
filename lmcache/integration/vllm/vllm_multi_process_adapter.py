@@ -32,6 +32,7 @@ from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
     TransferContext,
+    XPUDevicePtrTransferContext,
     create_transfer_context,
 )
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
@@ -1718,23 +1719,27 @@ class LMCacheMPWorkerAdapter:
                 self._heartbeat.stop()
 
         logger.info("Unregistering kv caches")
-        try:
-            unregister_type = (
-                RequestType.UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT
-                if isinstance(self.transfer_ctx, EngineDrivenTransferContext)
-                else RequestType.UNREGISTER_KV_CACHE
-            )
-            send_lmcache_request(
-                self.mq_client,
-                unregister_type,
-                [self.instance_id],
-            ).result(timeout=self._mq_timeout)
-        except TimeoutError:
-            logger.warning(
-                "LMCache server did not respond to unregister within %ss. "
-                "Proceeding with shutdown.",
-                self._mq_timeout,
-            )
+        # XPU contexts handle their own unregister in close() via
+        # UNREGISTER_XPU_KV_CACHE; skip the generic unregister to avoid
+        # "No handler registered" errors when the server runs in xpu mode.
+        if not isinstance(self.transfer_ctx, XPUDevicePtrTransferContext):
+            try:
+                unregister_type = (
+                    RequestType.UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT
+                    if isinstance(self.transfer_ctx, EngineDrivenTransferContext)
+                    else RequestType.UNREGISTER_KV_CACHE
+                )
+                send_lmcache_request(
+                    self.mq_client,
+                    unregister_type,
+                    [self.instance_id],
+                ).result(timeout=self._mq_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "LMCache server did not respond to unregister within %ss. "
+                    "Proceeding with shutdown.",
+                    self._mq_timeout,
+                )
 
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "shutdown")

@@ -60,6 +60,7 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
 from lmcache.v1.multiprocess.modules.lookup import LookupModule
 from lmcache.v1.multiprocess.modules.management import ManagementModule
 from lmcache.v1.multiprocess.modules.p2p_controller import P2PController
+from lmcache.v1.multiprocess.modules.xpu_transfer import XpuTransferModule
 from lmcache.v1.multiprocess.mq import MessageQueueServer
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
@@ -206,6 +207,8 @@ def _build_modules(
         transfer_modules.append(LMCacheDrivenTransferModule(ctx))
     elif mp_config.supported_transfer_mode == "engine_driven":
         transfer_modules.append(EngineDrivenTransferModule(ctx))
+    elif mp_config.supported_transfer_mode == "xpu":
+        transfer_modules.append(XpuTransferModule(ctx))
     elif mp_config.supported_transfer_mode == "auto":
         transfer_modules.append(LMCacheDrivenTransferModule(ctx))
         transfer_modules.append(EngineDrivenTransferModule(ctx))

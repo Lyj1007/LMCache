@@ -11,6 +11,9 @@ This module defines the protocol for:
 - LOOKUP: Submit a prefix lookup and return a prefetch job ID
 - QUERY_PREFETCH_STATUS: Poll a prefetch job for its result
 - END_SESSION: End a session and clean up associated resources
+- REGISTER_XPU_KV_CACHE / UNREGISTER_XPU_KV_CACHE / STORE_XPU /
+  RETRIEVE_XPU: XPU offload v2 path (see
+  ``docs/design/v1/multiprocess/xpu_offload_v2_design.md`` §7).
 """
 
 # Standard
@@ -23,6 +26,7 @@ from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
     RegisterEngineDrivenContextPayload,
+    RegisterXpuContextPayload,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
@@ -56,6 +60,29 @@ class RegisterEngineDrivenContextResponse:
     pool_size: int = 0
 
 
+@dataclass
+class RegisterXpuContextResponse:
+    """Response for REGISTER_XPU_KV_CACHE.
+
+    Carries handles the worker needs to attach the L1 SHM pool used for D2H
+    targets and the broadcast buffer (XPU offload v2 §7.1 / §10).
+
+    Attributes:
+        l1_shm_name: POSIX SHM segment name for the L1 pinned hugepage pool.
+            Empty when the server does not back L1 with SHM (e.g. when the
+            L1 manager uses non-SHM allocators).
+        l1_shm_size: Size in bytes of the L1 SHM segment. Zero if
+            ``l1_shm_name`` is empty.
+        broadcast_buffer_bytes: Worker-side broadcast buffer size in bytes
+            (XPU offload v2 §9.4). Zero means MLA broadcast is not used by
+            this instance (e.g. non-MLA model or single TP).
+    """
+
+    l1_shm_name: str = ""
+    l1_shm_size: int = 0
+    broadcast_buffer_bytes: int = 0
+
+
 # Define request names for this protocol group
 REQUEST_NAMES = [
     "REGISTER_KV_CACHE",
@@ -77,6 +104,10 @@ REQUEST_NAMES = [
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
     "COMMIT_RETRIEVE",
+    "REGISTER_XPU_KV_CACHE",
+    "UNREGISTER_XPU_KV_CACHE",
+    "STORE_XPU",
+    "RETRIEVE_XPU",
 ]
 
 # Type alias for cache keys
@@ -282,6 +313,49 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         ),
         "COMMIT_RETRIEVE": ProtocolDefinition(
             payload_classes=[KeyType, int],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Register XPU KV cache (XPU offload v2 §7.1).
+        # Payload:
+        #   - RegisterXpuContextPayload - layer ptr handles, group metadata,
+        #     TP rank/size, and L1 pool size hint.
+        # Returns: RegisterXpuContextResponse
+        "REGISTER_XPU_KV_CACHE": ProtocolDefinition(
+            payload_classes=[RegisterXpuContextPayload],
+            response_class=RegisterXpuContextResponse,
+            handler_type=HandlerType.SYNC,
+        ),
+        # Unregister XPU KV cache.
+        # Payload:
+        #   - instance_id: int - Worker process instance id
+        # Returns: None
+        "UNREGISTER_XPU_KV_CACHE": ProtocolDefinition(
+            payload_classes=[int],
+            response_class=None,
+            handler_type=HandlerType.SYNC,
+        ),
+        # XPU store (worker -> server).
+        # Payload:
+        #   - key: KeyType - Cache key for the chunk range.
+        #   - instance_id: int
+        #   - block_ids: list[list[int]] - Per-group block ids.
+        # Returns: bool - True on success, False otherwise.
+        "STORE_XPU": ProtocolDefinition(
+            payload_classes=[KeyType, int, list[list[int]]],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # XPU retrieve (worker -> server, TP0 only for MLA group).
+        # Payload:
+        #   - key: KeyType
+        #   - instance_id: int
+        #   - block_ids: list[list[int]]
+        #   - skip_blocks_per_group: list[int] - leading blocks to skip per
+        #     group (APC overlap guard, stored-block units).
+        # Returns: bool - True on success, False otherwise.
+        "RETRIEVE_XPU": ProtocolDefinition(
+            payload_classes=[KeyType, int, list[list[int]], list[int]],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),

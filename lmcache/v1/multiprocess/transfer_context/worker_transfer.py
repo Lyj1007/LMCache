@@ -867,6 +867,9 @@ def create_transfer_context(
             requested mode string is unknown, or the requested mode is not
             supported for the worker device.
     """
+    # First Party
+    from lmcache import is_kunlun_xpu
+
     if not kv_caches:
         raise ValueError("kv_caches is empty")
     device_types = {tensor.device.type for tensor in kv_caches.values()}
@@ -886,6 +889,16 @@ def create_transfer_context(
     if resolved_mode is MPTransferMode.ENGINE_DRIVEN:
         return _build_engine_driven_context()
     # AUTO: dispatch by device type (CUDA -> handle path, else -> data path).
+    # Kunlun XPU exposes itself as ``device.type == "cuda"`` via xmlir but
+    # cannot use cross-process CUDA IPC events, so it must take its own
+    # MQ-based device-pointer path (XPU offload v2 §8.2).
+    if is_kunlun_xpu():
+        # First Party
+        from lmcache.v1.multiprocess.transfer_context.xpu_transfer import (
+            XPUDevicePtrTransferContext,
+        )
+
+        return XPUDevicePtrTransferContext()
     if device_type == "cuda":
         return LMCacheDrivenTransferContext()
     return _build_engine_driven_context()

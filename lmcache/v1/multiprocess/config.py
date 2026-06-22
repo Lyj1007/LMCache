@@ -64,7 +64,9 @@ class MPServerConfig:
     supported_transfer_mode: str = "auto"
     """Transfer mode: 'lmcache_driven' for server-driven transfer
     (STORE/RETRIEVE, supports CUDA IPC and CPU SHM), 'engine_driven' for
-    engine-driven transfer (PREPARE/COMMIT), or 'auto' to enable both."""
+    engine-driven transfer (PREPARE/COMMIT), 'xpu' for the XPU
+    device-pointer offload v2 path (STORE_XPU/RETRIEVE_XPU), or 'auto' to
+    enable the lmcache-driven + engine-driven paths."""
 
     runtime_plugin_config: "RuntimePluginConfig" = field(
         default_factory=lambda: RuntimePluginConfig()
@@ -314,11 +316,13 @@ def add_mp_server_args(
         "--supported-transfer-mode",
         type=str,
         default="auto",
-        choices=["lmcache_driven", "engine_driven", "auto"],
+        choices=["lmcache_driven", "engine_driven", "xpu", "auto"],
         help="Supported transfer mode: 'lmcache_driven' for server-driven "
         "transfer (STORE/RETRIEVE, supports CUDA IPC and CPU SHM), "
         "'engine_driven' for engine-driven transfer (PREPARE/COMMIT), "
-        "or 'auto' to enable both transfer paths. Default is 'auto'.",
+        "'xpu' for the XPU device-pointer offload v2 path "
+        "(STORE_XPU/RETRIEVE_XPU), or 'auto' to enable the lmcache-driven "
+        "+ engine-driven paths. Default is 'auto'.",
     )
     mp_group.add_argument(
         "--runtime-plugin-locations",

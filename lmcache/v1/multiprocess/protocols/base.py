@@ -59,6 +59,13 @@ class RequestType(enum.Enum):
     PREPARE_RETRIEVE = enum.auto()
     COMMIT_RETRIEVE = enum.auto()
 
+    # XPU offload v2 operations (see
+    # docs/design/v1/multiprocess/xpu_offload_v2_design.md §7).
+    REGISTER_XPU_KV_CACHE = enum.auto()
+    UNREGISTER_XPU_KV_CACHE = enum.auto()
+    STORE_XPU = enum.auto()
+    RETRIEVE_XPU = enum.auto()
+
     # Controller operations
     CLEAR = enum.auto()
     GET_CHUNK_SIZE = enum.auto()

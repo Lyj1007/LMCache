@@ -63,11 +63,24 @@ def _build_device_registry() -> "dict[str, DeviceSpec]":
 def _detect_device() -> tuple[Any, str]:
     """Detect the available accelerator via the device registry.
 
+    Setting ``LMCACHE_FORCE_CPU=1`` short-circuits detection and pins the
+    process to the CPU stub.  This is how a device-free process (e.g. the
+    standalone LMCache MP server co-located with accelerator workers) opts
+    out of touching the accelerator runtime at all.  ``DEVICE_TYPE`` cannot
+    serve this role because ``CpuDeviceSpec.is_available()`` is False by
+    design, which sends ``DEVICE_TYPE=cpu`` back into auto-detection.
+
     Returns:
         tuple[Any, str]: A tuple of (torch_device_module, device_type_string).
             When torch is not installed (CLI-only mode), returns
             ``(None, "cpu")``.
     """
+    if os.environ.get("LMCACHE_FORCE_CPU") == "1":
+        # First Party
+        from lmcache.v1.platform.cpu.stub_cpu_device import StubCPUDevice
+
+        return StubCPUDevice("cpu"), "cpu"
+
     try:
         # Third Party
         import torch

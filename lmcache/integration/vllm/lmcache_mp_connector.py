@@ -34,7 +34,7 @@ import torch
 import zmq
 
 # First Party
-from lmcache import torch_dev
+from lmcache import is_kunlun_xpu, torch_dev
 from lmcache.banner import print_banner_once
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.kv_cache_group_edits import (
@@ -376,6 +376,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             if kv_cache_config is not None
             else ()
         )
+        # XPU does not support interprocess CUDA events (XPU offload v2 §2).
+        # Use process-local events instead; the BG thread synchronizes them
+        # before issuing the MQ request, so the server never races on device
+        # memory.
+        self._use_interprocess_events = not is_kunlun_xpu()
+
         # Tokens covered by one paged chunk (one block ID) of each engine
         # group, from the group's KV cache spec. Hybrid models can mix
         # different values (e.g. gemma-4: sliding-window groups 32,
@@ -507,7 +513,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if len(request_ids) == 0:
             return
 
-        event = torch_dev.Event(interprocess=True)
+        event = torch_dev.Event(interprocess=self._use_interprocess_events)
         event.record()
 
         self.worker_adapter.batched_submit_retrieve_requests(
@@ -583,7 +589,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 dispatch(self.dispatcher, "wait_for_save", event=None)
             return
 
-        event = torch_dev.Event(interprocess=True)
+        event = torch_dev.Event(interprocess=self._use_interprocess_events)
         event.record()
 
         self.worker_adapter.batched_submit_store_requests(

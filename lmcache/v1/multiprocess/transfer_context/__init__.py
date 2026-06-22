@@ -25,9 +25,13 @@ from .worker_transfer import (
     TransferContext,
     create_transfer_context,
 )
+from .xpu_broadcast import MLA_BROADCAST_SRC, BroadcastFn, XpuBroadcastCoordinator
+from .xpu_transfer import XPUDevicePtrTransferContext
 
 __all__ = [
+    "MLA_BROADCAST_SRC",
     "AsyncEngineDrivenTransferContext",
+    "BroadcastFn",
     "EngineDrivenTransferContext",
     "LMCacheDrivenTransferContext",
     "MPTransferMode",
@@ -37,6 +41,8 @@ __all__ = [
     "EngineDrivenContextShm",
     "ShmSlotDescriptor",
     "TransferContext",
+    "XPUDevicePtrTransferContext",
+    "XpuBroadcastCoordinator",
     "compute_kv_layout",
     "create_engine_driven_context",
     "create_transfer_context",

@@ -144,6 +144,83 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     use_mla: bool
 
 
+class XpuLayerHandle(msgspec.Struct):
+    """Cross-process pointer descriptor for one XPU KV-cache layer.
+
+    XPU exposes a flat physical address space, so the server process can
+    construct a tensor view of the worker's KV cache using
+    ``data_ptr() + shape + dtype`` without an IPC handle (see
+    ``docs/design/v1/multiprocess/xpu_offload_v2_design.md`` §6 / §7.1).
+
+    Attributes:
+        layer_name: Logical layer identifier matching the worker's
+            ``kv_caches`` dict key.
+        data_ptr: Device pointer (worker process address space) at which the
+            layer tensor starts. Valid in any peer XPU process.
+        shape: Layer tensor shape, ordered as the worker stores it.
+        dtype_str: Torch dtype name (e.g. ``"bfloat16"``).
+        group_id: LMCache KV-group id this layer belongs to. ``0`` is the
+            primary group; non-zero is for hybrid (DSV4-Flash) layouts.
+    """
+
+    layer_name: str
+    data_ptr: int
+    shape: list[int]
+    dtype_str: str
+    group_id: int = 0
+
+
+class XpuGroupView(msgspec.Struct):
+    """Per-group metadata required by the server XPU transfer module.
+
+    Attributes:
+        group_id: KV-group id (0 = primary, others = hybrid groups).
+        block_size: Tokens per paged block in this group.
+        blocks_per_chunk: Number of paged blocks per LMCache chunk in this
+            group (``per_layer_storage_blocks_per_chunk`` from
+            ``LayoutHints``).
+        is_mla: Whether this group is MLA (TP-replicated KV).
+    """
+
+    group_id: int
+    block_size: int
+    blocks_per_chunk: int
+    is_mla: bool
+
+
+class RegisterXpuContextPayload(msgspec.Struct):
+    """Payload for ``REGISTER_XPU_KV_CACHE`` (XPU offload v2 §7.1).
+
+    Attributes:
+        instance_id: Worker process instance identifier (typically PID).
+        model_name: Model name associated with this worker.
+        world_size: Worker world size used in cache keys.
+        tp_rank: TP rank of this worker within the inference engine TP group.
+        tp_size: TP size of the inference engine TP group.
+        layer_handles: Cross-process pointer descriptors for every KV-cache
+            layer this worker owns. The server uses
+            ``__cuda_array_interface__`` to wrap each as a remote tensor.
+        groups: Per-group metadata used to compute chunk strides and to drive
+            store/retrieve TP routing.
+        gpu_kv_format: ``GPUKVFormat`` enum value (int) describing the
+            physical KV layout. Forwarded by the server when calling
+            ``gather_multi_layer_block_kv_transfer`` /
+            ``scatter_multi_layer_block_kv_transfer``.
+        l1_pool_request_size: Bytes of L1 SHM pool the worker requests for
+            its D2H targets. ``0`` means "use server default".
+    """
+
+    instance_id: int
+    model_name: str
+    world_size: int
+    tp_rank: int
+    tp_size: int
+    layer_handles: list[XpuLayerHandle]
+    groups: list[XpuGroupView]
+    gpu_kv_format: int
+    l1_pool_request_size: int = 0
+
+
 @dataclass
 class CustomizedSerdeConfig:
     serializer: Callable[[Any], bytes]
