@@ -474,13 +474,21 @@ def _resolve_pinned_alloc_free(
         arguments.  Call ``ptr = resolved.alloc()`` and ``resolved.free(ptr)``.
     """
     if shm_name:
+        # ``use_hugepages`` is only consumed by the python_ops_fallback
+        # implementation (used on XPU). The CUDA C++ binding only accepts
+        # ``(size, shm_name)``, so we only forward the extra arg when the
+        # caller actually requested THP backing.
         if use_hugepages:
-            raise ValueError("Hugepages are not supported with shared memory (shm)")
+            shm_alloc_args = (size, shm_name, True)
+            shm_free_args = (size, shm_name, True)
+        else:
+            shm_alloc_args = (size, shm_name)
+            shm_free_args = (size, shm_name)
         return PinnedAllocFree(
             alloc_fn=lmc_ops.alloc_shm_pinned_ptr,
-            alloc_args=(size, shm_name),
+            alloc_args=shm_alloc_args,
             free_fn=lmc_ops.free_shm_pinned_ptr,
-            free_args=(size, shm_name),
+            free_args=shm_free_args,
         )
     elif numa_mapping:
         if torch_dev.is_available():

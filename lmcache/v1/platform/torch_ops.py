@@ -52,6 +52,86 @@ _pinned_ptr_registry: dict[int, int] = {}  # ptr -> size, for cudaHostUnregister
 _copy_lib_NOT_LOADED = object()
 _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
 
+# Cached libc handle for madvise() (lazy-initialized).
+_LIBC_NOT_LOADED = object()
+_libc: Optional[ctypes.CDLL] = _LIBC_NOT_LOADED  # type: ignore
+
+# madvise advice for transparent huge pages on Linux. Constant value is
+# stable across glibc versions; defining it inline avoids a hard
+# dependency on platform headers.
+_MADV_HUGEPAGE = 14
+
+# 2 MiB hugepage stride. ``madvise(MADV_HUGEPAGE)`` only sets a hint; the
+# kernel only materializes hugepages once a page in the range is touched.
+# We walk the region with a 2 MiB stride and write a single byte per
+# hugepage to drive THP collapse synchronously at allocation time.
+_HUGEPAGE_STRIDE = 2 * 1024 * 1024
+
+
+def _get_libc() -> Optional[ctypes.CDLL]:
+    """Lazily load and cache libc.so.6 for madvise() calls."""
+    global _libc
+    if _libc is _LIBC_NOT_LOADED:
+        try:
+            _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            # int madvise(void *addr, size_t length, int advice);
+            _libc.madvise.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            _libc.madvise.restype = ctypes.c_int
+        except OSError:
+            _libc = None
+    return _libc
+
+
+def _advise_thp_and_first_touch(ptr: int, size: int) -> bool:
+    """Apply madvise(MADV_HUGEPAGE) and 2 MiB-stride first-touch.
+
+    Args:
+        ptr: Base virtual address of the region.
+        size: Region size in bytes. The first-touch walk is bounded by
+            ``size``; THP collapse only succeeds for whole 2 MiB-aligned
+            sub-ranges, so unaligned tails simply remain on 4 KiB pages.
+
+    Returns:
+        True if ``madvise`` returned 0, False otherwise (e.g. libc could
+        not be loaded or the kernel rejected the advice). On False the
+        caller should still consider the region usable; it just will not
+        be THP-backed.
+    """
+    libc = _get_libc()
+    if libc is None or size == 0:
+        return False
+    rc = libc.madvise(ctypes.c_void_p(ptr), ctypes.c_size_t(size), _MADV_HUGEPAGE)
+    if rc != 0:
+        # errno is per-thread; reading it via ctypes.get_errno is safe here.
+        warnings.warn(
+            f"madvise(MADV_HUGEPAGE) failed with errno={ctypes.get_errno()}; "
+            "L1 SHM pool will fall back to 4 KiB pages.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    # 2 MiB-stride first-touch: write one byte per 2 MiB to fault each
+    # candidate hugepage. Use ctypes pointer arithmetic to avoid creating
+    # any Python-level bytes object.
+    base = ctypes.c_void_p(ptr)
+    one = ctypes.c_uint8(0)
+    off = 0
+    while off < size:
+        ctypes.memmove(
+            ctypes.c_void_p(ptr + off),
+            ctypes.byref(one),
+            1,
+        )
+        off += _HUGEPAGE_STRIDE
+    # Reference base to silence linters; the variable exists to keep the
+    # ``c_void_p`` alive across the loop in case ctypes optimizes it away.
+    _ = base
+    return True
+
 
 def _get_copy_lib() -> Optional[ctypes.CDLL]:
     """Lazily load and cache the CUDA/ROCm runtime library, or None for CPU fallback."""
@@ -452,11 +532,28 @@ def batched_memcpy(src_ptrs: list[int], dst_ptrs: list[int], sizes: list[int]) -
         )
 
 
-def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
+def alloc_shm_pinned_ptr(
+    size: int, shm_name: str = "", use_hugepages: bool = False
+) -> int:
     """Non-CUDA equivalent of allocating shared memory pinned pointer.
+
     Uses multiprocessing.shared_memory for cross-platform POSIX shm.
-    Attempts to pin the buffer via cudaHostRegister for async D2H;
-    if pinning fails, continues without pinning."""
+    Attempts to pin the buffer via the device spec for async D2H; if
+    pinning fails, continues without pinning.
+
+    Args:
+        size: Region size in bytes.
+        shm_name: POSIX shm segment name. Empty creates an anonymous one.
+        use_hugepages: When True, advise the mmap region with
+            ``MADV_HUGEPAGE`` and walk it at 2 MiB stride to first-touch
+            each candidate hugepage. The caller is expected to host-register
+            the resulting region in 4 GiB chunks afterwards (see
+            ``xpu_transfer._ensure_shm_registered``); the THP-backed region
+            then yields hugepage-pinned memory rather than 4 KiB pages.
+
+    Returns:
+        Aligned base pointer to the shared region as an integer.
+    """
 
     # Strip leading '/' for SharedMemory name
     name = shm_name.lstrip("/") if shm_name else None
@@ -476,6 +573,15 @@ def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
     buf = array_type.from_buffer(shm.buf)
     ptr = ctypes.addressof(buf)
 
+    if use_hugepages:
+        if _advise_thp_and_first_touch(ptr, size):
+            warnings.warn(
+                f"THP-advised SHM mmap: madvise(MADV_HUGEPAGE) succeeded for "
+                f"{size} bytes at 0x{ptr:x} (2 MiB-stride first-touch done).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     # Store references to keep them alive
     tensor = torch.frombuffer(buf, dtype=torch.uint8)
     _tensor_registry[ptr] = tensor
@@ -489,9 +595,25 @@ def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
     return ptr
 
 
-def free_shm_pinned_ptr(ptr: int, size: int = 0, shm_name: str = "") -> None:
-    """Non-CUDA equivalent of freeing a shared memory
-    pinned pointer. Unregisters pinned memory if it was pinned."""
+def free_shm_pinned_ptr(
+    ptr: int,
+    size: int = 0,
+    shm_name: str = "",
+    use_hugepages: bool = False,
+) -> None:
+    """Non-CUDA equivalent of freeing a shared memory pinned pointer.
+
+    Unregisters pinned memory if it was pinned.
+
+    Args:
+        ptr: Base pointer returned by :func:`alloc_shm_pinned_ptr`.
+        size: Region size in bytes. Unused on this code path; accepted
+            for parity with the CUDA C++ binding.
+        shm_name: POSIX shm name. Unused on this code path; the underlying
+            ``SharedMemory`` object already remembers it.
+        use_hugepages: Unused on the free path; kept for parity with the
+            allocator signature so callers can pass identical args.
+    """
 
     # Unpin if previously registered
     if ptr in _pinned_ptr_registry:

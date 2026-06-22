@@ -128,6 +128,16 @@ class L1MemoryManagerConfig:
     devdax_size_in_bytes: int = 0
     """ Optional Device-DAX overflow size for hybrid DRAM + DAX L1. """
 
+    use_hugepages: bool = field(default=False)
+    """ Whether to back the L1 pool with transparent huge pages (THP).
+
+    When True and a SHM-backed pool is in use, the allocator advises the
+    mmap region with MADV_HUGEPAGE and performs a 2 MiB-stride first-touch
+    so that the kernel materializes 2 MiB pages at allocation time. The
+    subsequent per-segment ``host_register`` then pins THP-backed memory
+    instead of 4 KiB pages, reducing TLB pressure during H2D/D2H. Default
+    False keeps the legacy 4 KiB-page behavior. """
+
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
 
@@ -404,6 +414,14 @@ def add_storage_manager_args(
             "that adapter's max_dax_size_gb is used as L1 overflow size."
         ),
     )
+    memory_group.add_argument(
+        "--l1-use-hugepages",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to back the L1 SHM pool with transparent huge pages "
+        "(THP) via madvise(MADV_HUGEPAGE) + 2 MiB-stride first-touch. "
+        "Default is False.",
+    )
 
     # GDS L1 tier (optional, opt-in via --gds-l1-path)
     gds_group = parser.add_argument_group(
@@ -563,6 +581,7 @@ def parse_args_to_config(
             init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
             align_bytes=args.l1_align_bytes,
             devdax_path=args.l1_devdax_path,
+            use_hugepages=args.l1_use_hugepages,
         )
     else:
         memory_config = L1MemoryManagerConfig(
@@ -572,6 +591,7 @@ def parse_args_to_config(
             align_bytes=args.l1_align_bytes,
             shm_name=shm_name,
             devdax_path=args.l1_devdax_path,
+            use_hugepages=args.l1_use_hugepages,
         )
 
     gds_l1_config: GdsL1Config | None = None
