@@ -247,7 +247,10 @@ class XPUDevicePtrTransferContext(TransferContext):
         self._broadcast_buffer: torch.Tensor | None = None
         self._broadcast_buffer_bytes: int = 0
         self._mla_group_ids: tuple[int, ...] = ()
-        self._submit_queue: "queue.Queue[Any]" = queue.Queue(
+        self._retrieve_queue: "queue.Queue[Any]" = queue.Queue(
+            maxsize=_SUBMIT_QUEUE_MAXSIZE
+        )
+        self._store_queue: "queue.Queue[Any]" = queue.Queue(
             maxsize=_SUBMIT_QUEUE_MAXSIZE
         )
         self._bg_thread: threading.Thread | None = None
@@ -568,16 +571,15 @@ class XPUDevicePtrTransferContext(TransferContext):
         if self._closed.is_set():
             return
         self._closed.set()
-        try:
-            self._submit_queue.put(
-                _SHUTDOWN_SENTINEL,
-                timeout=_SUBMIT_QUEUE_SHUTDOWN_PUT_SECONDS,
-            )
-        except queue.Full:
-            logger.warning(
-                "XPU transfer submit queue full while shutting down; "
-                "BG thread will exit via _closed flag"
-            )
+        # Send shutdown sentinel to both queues
+        for q in (self._retrieve_queue, self._store_queue):
+            try:
+                q.put(
+                    _SHUTDOWN_SENTINEL,
+                    timeout=_SUBMIT_QUEUE_SHUTDOWN_PUT_SECONDS,
+                )
+            except queue.Full:
+                pass
 
         thread = self._bg_thread
         joined_cleanly = True
@@ -591,7 +593,7 @@ class XPUDevicePtrTransferContext(TransferContext):
                     "queue_size=%d)",
                     _BG_JOIN_TIMEOUT_SECONDS,
                     self._instance_id,
-                    self._submit_queue.qsize(),
+                    self._retrieve_queue.qsize() + self._store_queue.qsize(),
                 )
 
         # Best-effort UNREGISTER_XPU_KV_CACHE; the server may already be
@@ -656,17 +658,23 @@ class XPUDevicePtrTransferContext(TransferContext):
             )
 
         future: MessagingFuture[bool] = MessagingFuture()
+        req = _BgRequest(
+            request_type=request_type,
+            event=event,
+            key=key,
+            instance_id=int(instance_id),
+            block_ids=block_ids,
+            future=future,
+            skip_blocks_per_group=skip_blocks_per_group,
+        )
+        target_queue = (
+            self._retrieve_queue
+            if request_type == RequestType.RETRIEVE_XPU
+            else self._store_queue
+        )
         try:
-            self._submit_queue.put(
-                _BgRequest(
-                    request_type=request_type,
-                    event=event,
-                    key=key,
-                    instance_id=int(instance_id),
-                    block_ids=block_ids,
-                    future=future,
-                    skip_blocks_per_group=skip_blocks_per_group,
-                ),
+            target_queue.put(
+                req,
                 timeout=self._mq_timeout if self._mq_timeout > 0 else None,
             )
         except queue.Full as exc:
@@ -678,33 +686,36 @@ class XPUDevicePtrTransferContext(TransferContext):
         return future
 
     def _bg_loop(self) -> None:
-        """Consume the submit queue and resolve futures.
+        """Consume dual queues with RETRIEVE priority and resolve futures.
 
-        Each iteration:
-          1. ``event.synchronize()`` — in-process, makes sure the server
-             can safely read peer device memory.
-          2. ``send_request(...).result(timeout=mq_timeout)`` — synchronous
-             MQ round trip.
-          3. ``future.set_result(...)`` with the server's bool ACK.
-
-        On any unexpected exception the future is set to ``False`` so
-        the caller can fall back to its slow path. The loop exits once
-        ``_closed`` is set and the queue is drained, or as soon as it
-        sees the ``_SHUTDOWN_SENTINEL``; pending futures left in the
-        queue at shutdown are completed with ``False`` so callers do
-        not deadlock waiting on them.
+        RETRIEVE requests are never blocked by queued STORE requests.
+        The loop always checks _retrieve_queue first; a STORE is only
+        started when no RETRIEVE is pending.
         """
         while True:
-            if self._closed.is_set() and self._submit_queue.empty():
+            if (
+                self._closed.is_set()
+                and self._retrieve_queue.empty()
+                and self._store_queue.empty()
+            ):
                 return
+            # Priority: always prefer retrieve over store
+            req = None
             try:
-                item = self._submit_queue.get(timeout=_BG_LOOP_POLL_SECONDS)
+                req = self._retrieve_queue.get_nowait()
             except queue.Empty:
-                continue
-            if item is _SHUTDOWN_SENTINEL:
+                try:
+                    req = self._store_queue.get_nowait()
+                except queue.Empty:
+                    try:
+                        req = self._retrieve_queue.get(
+                            timeout=_BG_LOOP_POLL_SECONDS
+                        )
+                    except queue.Empty:
+                        continue
+            if req is _SHUTDOWN_SENTINEL:
                 self._drain_queue_with_failures()
                 return
-            req: _BgRequest = item
             if self._closed.is_set():
                 req.future.set_result(False)
                 continue
@@ -765,22 +776,18 @@ class XPUDevicePtrTransferContext(TransferContext):
                 req.future.set_result(False)
 
     def _drain_queue_with_failures(self) -> None:
-        """Resolve any outstanding queue items as failures during shutdown.
-
-        Called from the BG thread once the shutdown sentinel is seen, so
-        that callers blocked on a :class:`MessagingFuture.result` do not
-        deadlock waiting for an ACK that will never arrive.
-        """
-        while True:
-            try:
-                item = self._submit_queue.get_nowait()
-            except queue.Empty:
-                return
-            if item is _SHUTDOWN_SENTINEL:
-                continue
-            req: _BgRequest = item
-            if not req.future.is_done_.is_set():
-                req.future.set_result(False)
+        """Resolve any outstanding queue items as failures during shutdown."""
+        for q in (self._retrieve_queue, self._store_queue):
+            while True:
+                try:
+                    item = q.get_nowait()
+                except queue.Empty:
+                    break
+                if item is _SHUTDOWN_SENTINEL:
+                    continue
+                req: _BgRequest = item
+                if not req.future.is_done_.is_set():
+                    req.future.set_result(False)
 
     @staticmethod
     def _allocate_broadcast_buffer(nbytes: int) -> torch.Tensor:
