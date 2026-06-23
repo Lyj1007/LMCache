@@ -588,6 +588,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # B3: enqueue broadcast for MLA groups after submit
         if getattr(self, '_broadcaster', None) is not None:
             self._enqueue_mla_broadcasts(request_ids, ops)
+            # B4: immediately drain — source waits for its retrieve future
+            # (bounded by mq_timeout) then broadcasts to peers. This keeps
+            # the retrieve+broadcast synchronous within start_load_kv.
+            self._broadcaster.drain_pending(self.worker_adapter._mq_timeout)
 
     def _enqueue_mla_broadcasts(
         self, request_ids: list[str], ops: list["LoadStoreOp"]

@@ -262,10 +262,10 @@ class XpuRetrieveBroadcaster:
         ``broadcast_send``. On peer ranks: call ``broadcast_recv``,
         then scatter the buffer back into the local KV.
 
-        Errors during gather / scatter / broadcast are logged but not
-        re-raised — the broadcast layer is a no-op verification path
-        in PR5a, so a failure here must not break the retrieve
-        baseline. PR5b will tighten this once the routing is real.
+        All items are always processed (never deferred) to ensure the
+        collective call count is symmetric across ranks. If a future
+        is not ready on the source, stale buffer is broadcast and vLLM
+        recompute handles correctness.
 
         Args:
             mq_timeout: Timeout in seconds applied to the source rank's
@@ -295,36 +295,42 @@ class XpuRetrieveBroadcaster:
                     item.request_id,
                     item.group_id,
                 )
-                if not is_src:
-                    raise  # PR5b: broadcast is the only data path for peers
 
     def _drive_source(
         self, item: _PendingBroadcast, mq_timeout: float
     ) -> None:
         """Source-rank path: wait → gather → broadcast_send."""
+        retrieve_ok = True
         if item.future is not None:
-            try:
-                item.future.result(timeout=mq_timeout)
-            except Exception:
-                logger.exception(
-                    "XPU MLA broadcast: src wait timed out / failed "
-                    "(request_id=%s group_id=%d); skipping",
-                    item.request_id,
-                    item.group_id,
-                )
-                return
+            if not item.future.query():
+                # Wait bounded time for BG thread to complete retrieve.
+                item.future.wait(timeout=mq_timeout)
+            if not item.future.query():
+                retrieve_ok = False
+            else:
+                try:
+                    item.future.result(timeout=0)
+                except Exception:
+                    retrieve_ok = False
         gb = self._group_buffers[item.group_id]
         n_blocks = len(item.block_ids)
         if n_blocks == 0:
+            self._coordinator.broadcast_send()
             return
         if n_blocks > gb.max_blocks:
             logger.error(
                 "XPU MLA broadcast: group=%d n_blocks=%d > max_blocks=%d; "
-                "skipping",
+                "sending stale buffer to unblock peers",
                 item.group_id,
                 n_blocks,
                 gb.max_blocks,
             )
+            self._coordinator.broadcast_send()
+            return
+        if not retrieve_ok:
+            # Retrieve failed but we must still broadcast to unblock peers.
+            # Send stale buffer content — peers will get garbage but won't hang.
+            self._coordinator.broadcast_send()
             return
         block_ids_dev = self._block_ids_to_device(item.block_ids)
         try:
@@ -349,9 +355,11 @@ class XpuRetrieveBroadcaster:
                 )
         except Exception:
             logger.exception(
-                "XPU MLA broadcast: gather failed group=%d; skipping send",
+                "XPU MLA broadcast: gather failed group=%d; "
+                "sending stale buffer to unblock peers",
                 item.group_id,
             )
+            self._coordinator.broadcast_send()
             return
         self._coordinator.broadcast_send()
 
@@ -360,15 +368,17 @@ class XpuRetrieveBroadcaster:
         gb = self._group_buffers[item.group_id]
         n_blocks = len(item.block_ids)
         if n_blocks == 0:
+            self._coordinator.broadcast_recv()
             return
         if n_blocks > gb.max_blocks:
             logger.error(
                 "XPU MLA broadcast: peer group=%d n_blocks=%d > "
-                "max_blocks=%d; skipping",
+                "max_blocks=%d; recv to unblock source then skip scatter",
                 item.group_id,
                 n_blocks,
                 gb.max_blocks,
             )
+            self._coordinator.broadcast_recv()
             return
         self._coordinator.broadcast_recv()
         block_ids_dev = self._block_ids_to_device(item.block_ids)
