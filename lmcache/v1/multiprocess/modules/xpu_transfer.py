@@ -280,6 +280,8 @@ class XpuInstanceEntry:
     retrieve_block_ids_buffer: Optional[torch.Tensor] = None
     # Pre-allocated compact buffer for slow-path store D2H.
     compact_buf: Optional[torch.Tensor] = None
+    # Pre-allocated compact buffer for slow-path retrieve H2D.
+    retrieve_compact_buf: Optional[torch.Tensor] = None
 
 
 class XpuTransferModule:
@@ -592,6 +594,7 @@ class XpuTransferModule:
                 store_block_ids_buffer,
                 retrieve_block_ids_buffer,
                 compact_buf,
+                retrieve_compact_buf,
             ) = self._build_kernel_metadata(
                 remote_layer_tensors, payload.groups, payload.layer_handles, device
             )
@@ -620,6 +623,7 @@ class XpuTransferModule:
                 store_block_ids_buffer=store_block_ids_buffer,
                 retrieve_block_ids_buffer=retrieve_block_ids_buffer,
                 compact_buf=compact_buf,
+                retrieve_compact_buf=retrieve_compact_buf,
             )
             self._instances[payload.instance_id] = entry
 
@@ -812,6 +816,7 @@ class XpuTransferModule:
         store_staging_buffer: Optional[torch.Tensor] = None
         retrieve_staging_buffer: Optional[torch.Tensor] = None
         compact_buf: Optional[torch.Tensor] = None
+        retrieve_compact_buf: Optional[torch.Tensor] = None
         if max_staging_bytes > 0:
             store_staging_buffer = torch.empty(
                 max_staging_bytes, dtype=torch.int8, device=device
@@ -822,6 +827,9 @@ class XpuTransferModule:
             max_total_bytes = max(total_bytes_per_group) if total_bytes_per_group else 0
             if max_total_bytes > 0:
                 compact_buf = torch.empty(
+                    max_total_bytes, dtype=torch.int8, device=device
+                )
+                retrieve_compact_buf = torch.empty(
                     max_total_bytes, dtype=torch.int8, device=device
                 )
 
@@ -853,6 +861,7 @@ class XpuTransferModule:
             store_block_ids_buffer,
             retrieve_block_ids_buffer,
             compact_buf,
+            retrieve_compact_buf,
         )
 
     def unregister_xpu_kv_cache(self, instance_id: int) -> None:
@@ -1144,13 +1153,17 @@ class XpuTransferModule:
                     src_flat[:total_bytes], non_blocking=True
                 )
             else:
-                # Slow path: per-layer copy for heterogeneous page sizes.
+                # Slow path: bulk H2D into compact_buf, then scatter to staging.
+                r_buf = entry.retrieve_compact_buf[:total_bytes] if (
+                    entry.retrieve_compact_buf is not None and total_bytes <= entry.retrieve_compact_buf.numel()
+                ) else torch.empty(total_bytes, dtype=torch.int8, device=entry.device)
+                r_buf.copy_(src_flat[:total_bytes], non_blocking=True)
                 dev_offset = 0
                 for li in range(nl):
                     ps = page_sizes[li]
                     nbytes = n_blocks * ps
-                    staging_view[li, :n_blocks, :ps].contiguous().view(-1).copy_(
-                        src_flat[dev_offset:dev_offset + nbytes], non_blocking=True
+                    staging_view[li, :n_blocks, :ps].copy_(
+                        r_buf[dev_offset:dev_offset + nbytes].view(n_blocks, ps)
                     )
                     dev_offset += nbytes
 
