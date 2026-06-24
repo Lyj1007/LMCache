@@ -405,7 +405,7 @@ class XpuTransferModule:
                 raise
 
     def _ensure_shm_registered(self) -> None:
-        """Host-register the L1 SHM pool in 4 GiB segments (idempotent).
+        """Host-register the L1 SHM pool as a single region (idempotent).
 
         See XPU offload v2 §10 — the L1 SHM pool backing D2H/H2D must be
         host-registered for device DMA before any transfer.
@@ -423,7 +423,7 @@ class XpuTransferModule:
 
         # The L1 pool is opened by ``StorageManager`` via POSIX SHM. We
         # discover its base pointer through the L1 manager's memory
-        # allocator, then host-register every 4 GiB segment.
+        # allocator, then host-register the entire pool in one call.
         try:
             l1_manager = self._ctx.storage_manager.l1_manager
             allocator = l1_manager.memory_allocator
@@ -436,20 +436,13 @@ class XpuTransferModule:
             self._shm_registered = True
             return
 
-        remaining = pool_size
-        cursor = base_ptr
-        while remaining > 0:
-            segment = min(remaining, _SHM_REGISTRATION_SEGMENT_BYTES)
-            host_register(cursor, segment)
-            self._registered_shm_segments.append((cursor, segment))
-            cursor += segment
-            remaining -= segment
+        host_register(base_ptr, pool_size)
+        self._registered_shm_segments.append((base_ptr, pool_size))
 
         self._shm_registered = True
         logger.info(
-            "XPU SHM host-registered: %d bytes across %d segments",
+            "XPU SHM host-registered: %d bytes in single region",
             pool_size,
-            len(self._registered_shm_segments),
         )
 
     def _unregister_shm_segments_locked(self) -> None:
@@ -965,10 +958,19 @@ class XpuTransferModule:
 
         ed = time.perf_counter()
         if reserved_dict:
+            total_bytes = sum(
+                mo.get_size() for mo in reserved_dict.values()
+            )
+            elapsed = ed - st
+            mib = total_bytes / (1024 * 1024)
+            bw = total_bytes / elapsed / (1024**3) if elapsed > 0 else 0.0
             logger.info(
-                "STORE_XPU stored %d tokens in %.3f s",
+                "STORE_XPU stored %d tokens, %.1f MiB in %.3f s (%.1f GiB/s) (request_id=%s)",
                 len(reserved_dict) * self._ctx.chunk_size,
-                ed - st,
+                mib,
+                elapsed,
+                bw,
+                key.request_id,
             )
         return True
 
@@ -1026,7 +1028,20 @@ class XpuTransferModule:
             if dst_tensor is not None:
                 dst_flat = dst_tensor.view(-1)
                 padded_bytes = nl * n_blocks * max_page
-                dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes])
+                try:
+                    dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes])
+                except RuntimeError as e:
+                    logger.error(
+                        "D2H copy failed: gi=%d nl=%d n_blocks=%d max_page=%d "
+                        "padded_bytes=%d dst_size=%d staging_size=%d "
+                        "dst_ptr=0x%x staging_ptr=0x%x err=%s",
+                        gi, nl, n_blocks, max_page, padded_bytes,
+                        dst_flat.numel(), staging_view.numel(),
+                        dst_flat.data_ptr(),
+                        staging_view.data_ptr(),
+                        e,
+                    )
+                    raise
 
     @_lmcache_nvtx_annotate
     def retrieve_xpu(
@@ -1060,6 +1075,7 @@ class XpuTransferModule:
 
         retrieve_succeeded = False
         prefetched_keys: list[ObjectKey] = []
+        total_bytes: int = 0
         try:
             with entry.retrieve_lock, self._ctx.storage_manager.read_prefetched_results(
                 obj_keys
@@ -1074,6 +1090,7 @@ class XpuTransferModule:
                     return False
                 prefetched_keys = obj_keys[: len(memory_objs)]
                 for chunk_idx, memory_obj in enumerate(memory_objs):
+                    total_bytes += memory_obj.get_size()
                     self._copy_memory_obj_to_chunk(
                         entry,
                         chunk_idx,
@@ -1090,10 +1107,16 @@ class XpuTransferModule:
                 self._ctx.storage_manager.finish_read_prefetched(prefetched_keys)
 
         ed = time.perf_counter()
+        elapsed = ed - st
+        mib = total_bytes / (1024 * 1024)
+        bw = total_bytes / elapsed / (1024**3) if elapsed > 0 else 0.0
         logger.info(
-            "RETRIEVE_XPU retrieved %d tokens in %.3f s",
+            "RETRIEVE_XPU retrieved %d tokens, %.1f MiB in %.3f s (%.1f GiB/s) (request_id=%s)",
             len(obj_keys) * self._ctx.chunk_size,
-            ed - st,
+            mib,
+            elapsed,
+            bw,
+            key.request_id,
         )
         return True
 

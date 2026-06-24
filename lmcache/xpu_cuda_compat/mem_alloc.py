@@ -29,11 +29,25 @@ _HUGE_PAGE_SIZE = 2 * 1024 * 1024
 _MADV_HUGEPAGE = 14
 _PROT_READ_WRITE = 0x3
 _MAP_PRIVATE_ANONYMOUS = 0x22
+_MAP_HUGETLB = 0x40000
+_MAP_HUGE_2MB = 21 << 26  # MAP_HUGE_SHIFT = 26
 _SYS_MBIND = 237
 _MPOL_BIND = 2
 
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 _libc.mmap.restype = ctypes.c_void_p
+_libc.mmap.argtypes = [
+    ctypes.c_void_p,   # addr
+    ctypes.c_size_t,   # length
+    ctypes.c_int,      # prot
+    ctypes.c_int,      # flags
+    ctypes.c_int,      # fd
+    ctypes.c_long,     # offset
+]
+_libc.madvise.restype = ctypes.c_int
+_libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+_libc.munmap.restype = ctypes.c_int
+_libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 
 # Two well-known install paths for libxpurt; first-found wins. Empty on
 # non-XPU hosts, in which case ``_pin_host_memory`` falls back to
@@ -81,12 +95,26 @@ def _pin_host_memory(ptr: int, size: int) -> None:
             ctypes.c_void_p(ptr), ctypes.c_size_t(size), ctypes.c_uint(0)
         )
         if ret != 0:
-            raise RuntimeError(f"xpu_host_register failed: {ret}")
+            raise RuntimeError(
+                f"xpu_host_register failed: ret={ret}, "
+                f"ptr=0x{ptr:x}, size={size}"
+            )
+        logger.info(
+            "xpu_host_register OK: ptr=0x%x, size=%d (%.2f GB)",
+            ptr, size, size / (1024**3),
+        )
         return
 
     ret = torch.cuda.cudart().cudaHostRegister(ptr, size, 0)
     if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed: {ret}")
+        raise RuntimeError(
+            f"cudaHostRegister failed: ret={ret}, "
+            f"ptr=0x{ptr:x}, size={size}"
+        )
+    logger.info(
+        "cudaHostRegister OK: ptr=0x%x, size=%d (%.2f GB)",
+        ptr, size, size / (1024**3),
+    )
 
 
 def _unpin_host_memory(ptr: int) -> None:
@@ -132,7 +160,11 @@ def _bind_numa(ptr: int, size: int, numa_id: int) -> None:
 
 
 def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
-    """Allocate THP-advised anonymous memory and pin it for device DMA.
+    """Allocate hugepage-backed anonymous memory and pin it for device DMA.
+
+    First attempts explicit hugetlb (MAP_HUGETLB) allocation. If that fails
+    (e.g. insufficient reserved hugepages), falls back to transparent huge
+    pages (THP) via madvise(MADV_HUGEPAGE).
 
     Args:
         size: Requested allocation size in bytes.
@@ -143,28 +175,50 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
         Pointer to the pinned host allocation.
 
     Raises:
-        RuntimeError: If mapping, registration, or cleanup fails.
+        RuntimeError: If both allocation paths fail, or pin fails.
     """
     aligned_size = _align_hugepage(size)
+
+    # Try explicit hugetlb first
     ptr = _libc.mmap(
         None,
         aligned_size,
         _PROT_READ_WRITE,
-        _MAP_PRIVATE_ANONYMOUS,
+        _MAP_PRIVATE_ANONYMOUS | _MAP_HUGETLB | _MAP_HUGE_2MB,
         -1,
         0,
     )
-    if ptr == ctypes.c_void_p(-1).value:
-        raise RuntimeError(f"mmap failed: {ctypes.get_errno()}")
+    use_hugetlb = (ptr != ctypes.c_void_p(-1).value)
+    if use_hugetlb:
+        logger.info(
+            "Explicit hugetlb mmap OK: size=%d (%.2f GB)",
+            aligned_size, aligned_size / (1024**3),
+        )
+    else:
+        # Fallback to THP
+        logger.info(
+            "Explicit hugetlb mmap failed (errno=%d), falling back to THP",
+            ctypes.get_errno(),
+        )
+        ptr = _libc.mmap(
+            None,
+            aligned_size,
+            _PROT_READ_WRITE,
+            _MAP_PRIVATE_ANONYMOUS,
+            -1,
+            0,
+        )
+        if ptr == ctypes.c_void_p(-1).value:
+            raise RuntimeError(f"mmap failed: {ctypes.get_errno()}")
 
     pinned = False
     try:
         if numa_id is not None:
             _bind_numa(ptr, aligned_size, numa_id)
-        _libc.madvise(ctypes.c_void_p(ptr), aligned_size, _MADV_HUGEPAGE)
-        # Touch one byte per hugepage to fault the THP allocation in before
-        # registering it for DMA. ``cudaHostRegister`` on a non-faulted
-        # page can silently degrade to small-page mappings.
+        if not use_hugetlb:
+            _libc.madvise(ctypes.c_void_p(ptr), aligned_size, _MADV_HUGEPAGE)
+        # Touch one byte per hugepage to fault the allocation in before
+        # registering it for DMA.
         for offset in range(0, aligned_size, _HUGE_PAGE_SIZE):
             ctypes.memset(ptr + offset, 0, 1)
         _pin_host_memory(ptr, aligned_size)
@@ -182,13 +236,14 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
 
     _allocation_sizes[ptr] = aligned_size
     logger.info(
-        "XPU THP pinned host allocation succeeded "
+        "XPU pinned host allocation succeeded "
         "(ptr=0x%x, requested_size=%d, aligned_size=%d, numa_id=%s, "
-        "pin_backend=%s)",
+        "hugepage=%s, pin_backend=%s)",
         ptr,
         size,
         aligned_size,
         numa_id,
+        "hugetlb" if use_hugetlb else "THP",
         "xpurt" if _libxpurt is not None else "cuda_cudart",
     )
     return ptr
