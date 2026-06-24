@@ -173,8 +173,11 @@ def _layout_desc_from_groups(
     Returns:
         A :class:`MemoryLayoutDesc` covering all groups in ``groups`` order.
     """
-    # Compute per-group total page bytes (sum across layers).
+    # Compute per-group total page bytes using padded (max_page) layout.
+    # This wastes ~5% SHM but enables single bulk D2H/H2D without reformat.
     group_page_bytes: dict[int, int] = {}
+    group_layer_count: dict[int, int] = {}
+    group_max_page: dict[int, int] = {}
     for h in layer_handles:
         shape = tuple(h.shape)
         num_blocks = shape[0]
@@ -183,12 +186,17 @@ def _layout_desc_from_groups(
             numel *= int(s)
         elem_size = torch.tensor([], dtype=_resolve_dtype(h.dtype_str)).element_size()
         page_bytes = (numel // num_blocks) * elem_size
-        group_page_bytes[h.group_id] = group_page_bytes.get(h.group_id, 0) + page_bytes
+        group_layer_count[h.group_id] = group_layer_count.get(h.group_id, 0) + 1
+        prev_max = group_max_page.get(h.group_id, 0)
+        if page_bytes > prev_max:
+            group_max_page[h.group_id] = page_bytes
 
     shapes: list[torch.Size] = []
     dtypes: list[torch.dtype] = []
     for g in groups:
-        total_bytes = group_page_bytes.get(g.group_id, 0) * g.blocks_per_chunk
+        nl = group_layer_count.get(g.group_id, 0)
+        max_page = group_max_page.get(g.group_id, 0)
+        total_bytes = nl * max_page * g.blocks_per_chunk
         shapes.append(torch.Size([total_bytes]))
         dtypes.append(torch.int8)
     return MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
@@ -1013,30 +1021,12 @@ class XpuTransferModule:
                 paged_buffer_ptrs_dev=entry.paged_buffer_ptrs_devs[gi],
             )
 
-            # Copy staging → host MemoryObj per-group tensor
+            # Copy staging → host MemoryObj per-group tensor (padded layout)
             dst_tensor = memory_obj.get_tensor(gi)
             if dst_tensor is not None:
                 dst_flat = dst_tensor.view(-1)
-                total_bytes = sum(ps * n_blocks for ps in page_sizes)
-                # Fast path: uniform page sizes → staging is already
-                # contiguous and layout-aligned with host flat tensor.
-                if entry.is_uniform_per_group[gi]:
-                    src = staging_view[:nl, :n_blocks, :max_page].contiguous().view(-1)[:total_bytes]
-                    dst_flat[:total_bytes].copy_(src, non_blocking=True)
-                else:
-                    # Slow path: gather per-layer slices into pre-allocated compact buf.
-                    compact_buf = entry.compact_buf[:total_bytes] if (
-                        entry.compact_buf is not None and total_bytes <= entry.compact_buf.numel()
-                    ) else torch.empty(total_bytes, dtype=torch.int8, device=entry.device)
-                    dev_offset = 0
-                    for li in range(nl):
-                        ps = page_sizes[li]
-                        nbytes = n_blocks * ps
-                        compact_buf[dev_offset:dev_offset + nbytes].copy_(
-                            staging_view[li, :n_blocks, :ps].contiguous().view(-1)
-                        )
-                        dev_offset += nbytes
-                    dst_flat[:total_bytes].copy_(compact_buf)
+                padded_bytes = nl * n_blocks * max_page
+                dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes])
 
     @_lmcache_nvtx_annotate
     def retrieve_xpu(
@@ -1145,27 +1135,11 @@ class XpuTransferModule:
             if src_tensor is None:
                 continue
             src_flat = src_tensor.view(-1)
-            total_bytes = sum(ps * n_blocks for ps in page_sizes)
-            # Fast path: all layers have the same page size, so host flat
-            # layout matches staging layout exactly → single bulk H2D copy.
-            if entry.is_uniform_per_group[gi]:
-                staging_view[:nl, :n_blocks, :max_page].view(-1)[:total_bytes].copy_(
-                    src_flat[:total_bytes], non_blocking=True
-                )
-            else:
-                # Slow path: bulk H2D into compact_buf, then scatter to staging.
-                r_buf = entry.retrieve_compact_buf[:total_bytes] if (
-                    entry.retrieve_compact_buf is not None and total_bytes <= entry.retrieve_compact_buf.numel()
-                ) else torch.empty(total_bytes, dtype=torch.int8, device=entry.device)
-                r_buf.copy_(src_flat[:total_bytes], non_blocking=True)
-                dev_offset = 0
-                for li in range(nl):
-                    ps = page_sizes[li]
-                    nbytes = n_blocks * ps
-                    staging_view[li, :n_blocks, :ps].copy_(
-                        r_buf[dev_offset:dev_offset + nbytes].view(n_blocks, ps)
-                    )
-                    dev_offset += nbytes
+            # Host now stores padded layout — single bulk H2D copy.
+            padded_bytes = nl * n_blocks * max_page
+            staging_view.view(-1)[:padded_bytes].copy_(
+                src_flat[:padded_bytes]
+            )
 
             # Reuse pre-allocated retrieve block_ids buffer
             if entry.retrieve_block_ids_buffer is not None and n_blocks <= entry.retrieve_block_ids_buffer.numel():
