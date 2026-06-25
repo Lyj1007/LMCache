@@ -6,10 +6,11 @@ transfers, but the default Python fallback does not request huge pages.
 This module provides THP-backed pinned host allocation for LMCache CPU
 buffers when ``local_cpu_use_hugepages`` is enabled.
 
-The L1 SHM pool used by the XPU offload v2 design (see
-``docs/design/v1/multiprocess/xpu_offload_v2_design.md`` §10) is registered
-via the same ``_pin_host_memory`` helper in 4 GiB segments at server
-startup.
+Host registration is performed in 4 GiB segments (see
+``_PIN_SEGMENT_BYTES``) to avoid the Kunlun XPU driver's 32-bit SGL size
+overflow in ``memdescCreate`` (``mem_desc.c:282``).  This allows
+registering buffers larger than 512 GiB in a single ``_pin_host_memory``
+call.
 """
 
 # Standard
@@ -67,6 +68,19 @@ for _path in _xpurt_paths:
 # region without forcing callers to remember the aligned size.
 _allocation_sizes: dict[int, int] = {}
 
+# Maximum bytes per single ``xpu_host_register`` / ``cudaHostRegister`` call.
+# The Kunlun XPU driver asserts ``SglSize <= 0xffffffffULL`` in
+# ``memdescCreate`` (mem_desc.c:282); registering 1024 GiB in a single call
+# overflows an internal 32-bit field, while 512 GiB is known to work.  128 GiB
+# segments give a 4× safety margin below the verified 512 GiB ceiling and
+# keep the number of ioctl round-trips small (8 segments for 1 TiB).
+_PIN_SEGMENT_BYTES: int = 128 * 1024 * 1024 * 1024
+
+# Tracks registered segments per base pointer so ``_unpin_host_memory`` can
+# unregister each segment individually.  Key is the original base pointer
+# passed to ``_pin_host_memory``; value is a list of (segment_ptr, seg_size).
+_pinned_segments: dict[int, list[tuple[int, int]]] = {}
+
 
 def _align_hugepage(size: int) -> int:
     """Round a byte size up to the THP hugepage boundary.
@@ -80,12 +94,12 @@ def _align_hugepage(size: int) -> int:
     return (size + _HUGE_PAGE_SIZE - 1) & ~(_HUGE_PAGE_SIZE - 1)
 
 
-def _pin_host_memory(ptr: int, size: int) -> None:
-    """Register a host allocation for XPU or CUDA DMA.
+def _pin_single(ptr: int, size: int) -> None:
+    """Register a single contiguous host memory segment for device DMA.
 
     Args:
-        ptr: Host memory pointer returned by ``mmap``.
-        size: Allocation size in bytes to register.
+        ptr: Host memory pointer (already offset to segment start).
+        size: Segment size in bytes.
 
     Raises:
         RuntimeError: If the host registration API reports an error.
@@ -99,10 +113,6 @@ def _pin_host_memory(ptr: int, size: int) -> None:
                 f"xpu_host_register failed: ret={ret}, "
                 f"ptr=0x{ptr:x}, size={size}"
             )
-        logger.info(
-            "xpu_host_register OK: ptr=0x%x, size=%d (%.2f GB)",
-            ptr, size, size / (1024**3),
-        )
         return
 
     ret = torch.cuda.cudart().cudaHostRegister(ptr, size, 0)
@@ -111,17 +121,13 @@ def _pin_host_memory(ptr: int, size: int) -> None:
             f"cudaHostRegister failed: ret={ret}, "
             f"ptr=0x{ptr:x}, size={size}"
         )
-    logger.info(
-        "cudaHostRegister OK: ptr=0x%x, size=%d (%.2f GB)",
-        ptr, size, size / (1024**3),
-    )
 
 
-def _unpin_host_memory(ptr: int) -> None:
-    """Unregister a pinned host allocation.
+def _unpin_single(ptr: int) -> None:
+    """Unregister a single host memory segment.
 
     Args:
-        ptr: Host memory pointer previously passed to ``_pin_host_memory``.
+        ptr: Segment pointer previously passed to ``_pin_single``.
 
     Raises:
         RuntimeError: If the host unregister API reports an error.
@@ -135,6 +141,102 @@ def _unpin_host_memory(ptr: int) -> None:
     ret = torch.cuda.cudart().cudaHostUnregister(ptr)
     if ret != 0:
         raise RuntimeError(f"cudaHostUnregister failed: {ret}")
+
+
+def _pin_host_memory(ptr: int, size: int) -> None:
+    """Register a host allocation for XPU or CUDA DMA.
+
+    Buffers larger than ``_PIN_SEGMENT_BYTES`` are registered in 128 GiB
+    segments to avoid the Kunlun XPU driver's 32-bit SGL size overflow
+    (``SglSize <= 0xffffffffULL`` assertion in ``memdescCreate``).  Each
+    segment is tracked in ``_pinned_segments`` so the corresponding
+    ``_unpin_host_memory`` call can unregister them individually.
+
+    Args:
+        ptr: Host memory pointer returned by ``mmap``.
+        size: Allocation size in bytes to register.
+
+    Raises:
+        RuntimeError: If the host registration API reports an error.  Any
+            segments already registered before the failure are rolled back.
+    """
+    if size <= _PIN_SEGMENT_BYTES:
+        _pin_single(ptr, size)
+        _pinned_segments[ptr] = [(ptr, size)]
+        logger.info(
+            "Host registration OK: ptr=0x%x, size=%d (%.2f GB), segments=1",
+            ptr, size, size / (1024**3),
+        )
+        return
+
+    segments: list[tuple[int, int]] = []
+    offset = 0
+    num_segments = (size + _PIN_SEGMENT_BYTES - 1) // _PIN_SEGMENT_BYTES
+    logger.info(
+        "Host registration started: ptr=0x%x, size=%d (%.2f GB), "
+        "segments=%d (%d GiB each)",
+        ptr, size, size / (1024**3), num_segments,
+        _PIN_SEGMENT_BYTES // (1024**3),
+    )
+    while offset < size:
+        seg_size = min(_PIN_SEGMENT_BYTES, size - offset)
+        seg_ptr = ptr + offset
+        try:
+            _pin_single(seg_ptr, seg_size)
+        except RuntimeError:
+            logger.error(
+                "Host registration failed at offset %d / %d, "
+                "rolling back %d segments",
+                offset, size, len(segments),
+            )
+            for sp, _ss in reversed(segments):
+                try:
+                    _unpin_single(sp)
+                except Exception:
+                    logger.exception(
+                        "Rollback: unregister failed at 0x%x", sp
+                    )
+            raise
+        segments.append((seg_ptr, seg_size))
+        offset += seg_size
+        if offset % (64 * 1024**3) < _PIN_SEGMENT_BYTES or offset == size:
+            logger.info(
+                "Host registration progress: %d / %d (%.1f%%)",
+                offset, size, offset / size * 100,
+            )
+
+    _pinned_segments[ptr] = segments
+    logger.info(
+        "Host registration complete: ptr=0x%x, size=%d (%.2f GB), "
+        "segments=%d",
+        ptr, size, size / (1024**3), len(segments),
+    )
+
+
+def _unpin_host_memory(ptr: int) -> None:
+    """Unregister a pinned host allocation.
+
+    If the allocation was registered in segments by ``_pin_host_memory``,
+    each segment is unregistered individually.  Falls back to a single
+    unregister call for pointers not found in ``_pinned_segments``.
+
+    Args:
+        ptr: Host memory pointer previously passed to ``_pin_host_memory``.
+
+    Raises:
+        RuntimeError: If the host unregister API reports an error.
+    """
+    segments = _pinned_segments.pop(ptr, None)
+    if segments is not None:
+        for seg_ptr, _ss in segments:
+            _unpin_single(seg_ptr)
+        logger.info(
+            "Host unregistration complete: ptr=0x%x, segments=%d",
+            ptr, len(segments),
+        )
+        return
+
+    _unpin_single(ptr)
 
 
 def _bind_numa(ptr: int, size: int, numa_id: int) -> None:
@@ -319,8 +421,8 @@ def free_hugepage_pinned_numa_ptr(ptr: int, size: int = 0) -> None:
 def host_register(ptr: int, size: int) -> None:
     """Register an externally-mapped host buffer for device DMA.
 
-    Used by the L1 SHM pool host-registration code (XPU offload v2 §10) to
-    register POSIX-SHM-backed segments in 4 GiB chunks at server startup.
+    Used by the L1 SHM pool host-registration code (XPU offload v2 §10).
+    Segmentation is handled internally by ``_pin_host_memory``.
 
     Args:
         ptr: Host memory pointer to register.
