@@ -27,6 +27,10 @@ from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
 _HUGE_PAGE_SIZE = 2 * 1024 * 1024
+try:
+    _SMALL_PAGE_SIZE = int(os.sysconf("SC_PAGESIZE"))
+except (ValueError, OSError):
+    _SMALL_PAGE_SIZE = 4096
 _MADV_HUGEPAGE = 14
 _PROT_READ_WRITE = 0x3
 _MAP_PRIVATE_ANONYMOUS = 0x22
@@ -92,6 +96,19 @@ def _align_hugepage(size: int) -> int:
         Size aligned up to the next 2 MiB hugepage boundary.
     """
     return (size + _HUGE_PAGE_SIZE - 1) & ~(_HUGE_PAGE_SIZE - 1)
+
+
+def _align_smallpage(size: int) -> int:
+    """Round a byte size up to the system page size boundary.
+
+    Args:
+        size: Requested allocation size in bytes.
+
+    Returns:
+        Size aligned up to the next system page boundary.
+    """
+    ps = _SMALL_PAGE_SIZE
+    return (size + ps - 1) & ~(ps - 1)
 
 
 def _pin_single(ptr: int, size: int) -> None:
@@ -264,9 +281,16 @@ def _bind_numa(ptr: int, size: int, numa_id: int) -> None:
 def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
     """Allocate hugepage-backed anonymous memory and pin it for device DMA.
 
-    First attempts explicit hugetlb (MAP_HUGETLB) allocation. If that fails
-    (e.g. insufficient reserved hugepages), falls back to transparent huge
-    pages (THP) via madvise(MADV_HUGEPAGE).
+    Allocation proceeds in three tiers; the first that succeeds wins:
+
+    1. Explicit hugetlb (``MAP_HUGETLB | MAP_HUGE_2MB``) -- best TLB hit
+       rate but requires reserved hugepages in the kernel pool.
+    2. Transparent huge pages (THP) via ``madvise(MADV_HUGEPAGE)`` -- relies
+       on the khugepaged kernel thread; works without a reserved pool.
+    3. Regular small pages -- last-resort fallback so the server can still
+       start when the hugepage pool is exhausted and THP cannot deliver
+       2 MiB pages due to memory fragmentation. A ``WARN`` is logged and
+       the allocation is tracked so callers can detect the degradation.
 
     Args:
         size: Requested allocation size in bytes.
@@ -277,53 +301,86 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
         Pointer to the pinned host allocation.
 
     Raises:
-        RuntimeError: If both allocation paths fail, or pin fails.
+        RuntimeError: If all three allocation paths fail, or pin fails.
     """
-    aligned_size = _align_hugepage(size)
+    hp_size = _align_hugepage(size)
 
-    # Try explicit hugetlb first
+    # Tier 1: explicit hugetlb
     ptr = _libc.mmap(
         None,
-        aligned_size,
+        hp_size,
         _PROT_READ_WRITE,
         _MAP_PRIVATE_ANONYMOUS | _MAP_HUGETLB | _MAP_HUGE_2MB,
         -1,
         0,
     )
-    use_hugetlb = (ptr != ctypes.c_void_p(-1).value)
-    if use_hugetlb:
+    if ptr != ctypes.c_void_p(-1).value:
+        mmap_size = hp_size
+        fault_stride = _HUGE_PAGE_SIZE
+        mode = "hugetlb"
         logger.info(
             "Explicit hugetlb mmap OK: size=%d (%.2f GB)",
-            aligned_size, aligned_size / (1024**3),
+            mmap_size, mmap_size / (1024**3),
         )
     else:
-        # Fallback to THP
+        hp_errno = ctypes.get_errno()
         logger.info(
             "Explicit hugetlb mmap failed (errno=%d), falling back to THP",
-            ctypes.get_errno(),
+            hp_errno,
         )
+        # Tier 2: THP via madvise(MADV_HUGEPAGE)
         ptr = _libc.mmap(
             None,
-            aligned_size,
+            hp_size,
             _PROT_READ_WRITE,
             _MAP_PRIVATE_ANONYMOUS,
             -1,
             0,
         )
-        if ptr == ctypes.c_void_p(-1).value:
-            raise RuntimeError(f"mmap failed: {ctypes.get_errno()}")
+        if ptr != ctypes.c_void_p(-1).value:
+            mmap_size = hp_size
+            fault_stride = _HUGE_PAGE_SIZE
+            mode = "THP"
+        else:
+            thp_errno = ctypes.get_errno()
+            # Tier 3: regular small pages
+            logger.warning(
+                "THP mmap failed (errno=%d); falling back to regular "
+                "small pages. KV-transfer host buffers will use %d KiB "
+                "pages, which increases TLB pressure and may reduce "
+                "H2D/D2H throughput.",
+                thp_errno, _SMALL_PAGE_SIZE // 1024,
+            )
+            mmap_size = _align_smallpage(size)
+            ptr = _libc.mmap(
+                None,
+                mmap_size,
+                _PROT_READ_WRITE,
+                _MAP_PRIVATE_ANONYMOUS,
+                -1,
+                0,
+            )
+            if ptr == ctypes.c_void_p(-1).value:
+                raise RuntimeError(
+                    f"mmap failed at all tiers "
+                    f"(hugetlb errno={hp_errno}, "
+                    f"THP errno={thp_errno}, "
+                    f"smallpage errno={ctypes.get_errno()})"
+                )
+            fault_stride = _SMALL_PAGE_SIZE
+            mode = "smallpage"
 
     pinned = False
     try:
         if numa_id is not None:
-            _bind_numa(ptr, aligned_size, numa_id)
-        if not use_hugetlb:
-            _libc.madvise(ctypes.c_void_p(ptr), aligned_size, _MADV_HUGEPAGE)
-        # Touch one byte per hugepage to fault the allocation in before
-        # registering it for DMA.
-        for offset in range(0, aligned_size, _HUGE_PAGE_SIZE):
+            _bind_numa(ptr, mmap_size, numa_id)
+        if mode == "THP":
+            _libc.madvise(ctypes.c_void_p(ptr), mmap_size, _MADV_HUGEPAGE)
+        # Touch one byte per page (huge or small) to fault the allocation
+        # in before registering it for DMA.
+        for offset in range(0, mmap_size, fault_stride):
             ctypes.memset(ptr + offset, 0, 1)
-        _pin_host_memory(ptr, aligned_size)
+        _pin_host_memory(ptr, mmap_size)
         pinned = True
     except Exception:
         if pinned:
@@ -333,21 +390,27 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
                 logger.exception(
                     "xpu_host_unregister failed during rollback at 0x%x", ptr
                 )
-        _libc.munmap(ctypes.c_void_p(ptr), aligned_size)
+        _libc.munmap(ctypes.c_void_p(ptr), mmap_size)
         raise
 
-    _allocation_sizes[ptr] = aligned_size
+    _allocation_sizes[ptr] = mmap_size
     logger.info(
         "XPU pinned host allocation succeeded "
-        "(ptr=0x%x, requested_size=%d, aligned_size=%d, numa_id=%s, "
+        "(ptr=0x%x, requested_size=%d, mmap_size=%d, numa_id=%s, "
         "hugepage=%s, pin_backend=%s)",
         ptr,
         size,
-        aligned_size,
+        mmap_size,
         numa_id,
-        "hugetlb" if use_hugetlb else "THP",
+        mode,
         "xpurt" if _libxpurt is not None else "cuda_cudart",
     )
+    if mode == "smallpage":
+        logger.warning(
+            "Host buffer at 0x%x is backed by small pages (no hugepages "
+            "available); expect reduced H2D/D2H throughput.",
+            ptr,
+        )
     return ptr
 
 
