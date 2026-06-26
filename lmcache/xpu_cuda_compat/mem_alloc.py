@@ -36,6 +36,7 @@ _PROT_READ_WRITE = 0x3
 _MAP_PRIVATE_ANONYMOUS = 0x22
 _MAP_HUGETLB = 0x40000
 _MAP_HUGE_2MB = 21 << 26  # MAP_HUGE_SHIFT = 26
+_MAP_POPULATE = 0x8000
 _SYS_MBIND = 237
 _MPOL_BIND = 2
 
@@ -281,16 +282,24 @@ def _bind_numa(ptr: int, size: int, numa_id: int) -> None:
 def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
     """Allocate hugepage-backed anonymous memory and pin it for device DMA.
 
-    Allocation proceeds in three tiers; the first that succeeds wins:
+    Allocation proceeds in tiers; the first that succeeds wins:
 
     1. Explicit hugetlb (``MAP_HUGETLB | MAP_HUGE_2MB``) -- best TLB hit
-       rate but requires reserved hugepages in the kernel pool.
-    2. Transparent huge pages (THP) via ``madvise(MADV_HUGEPAGE)`` -- relies
-       on the khugepaged kernel thread; works without a reserved pool.
-    3. Regular small pages -- last-resort fallback so the server can still
-       start when the hugepage pool is exhausted and THP cannot deliver
-       2 MiB pages due to memory fragmentation. A ``WARN`` is logged and
-       the allocation is tracked so callers can detect the degradation.
+       rate, allocated from the reserved hugepage pool. Fast because the
+       pool is pre-reserved (no per-fault compaction). Pre-faulted with a
+       2 MiB stride before pinning.
+    2. ``MAP_POPULATE`` anonymous small pages -- fast fallback when the
+       hugepage pool is empty. The kernel populates all page tables inside
+       the ``mmap`` syscall (efficient bulk allocation, no userspace fault
+       loop). ``madvise(MADV_HUGEPAGE)`` is intentionally NOT called: on a
+       fragmented system with ``thp.defrag=madvise`` it would trigger
+       synchronous direct compaction on every fault, turning a 1.5 TiB
+       allocation into a 20+ minute stall. With the system-level
+       ``thp.enabled=always`` the kernel still uses 2 MiB pages where the
+       buddy allocator has them free (zero-cost THP); the rest are 4 KiB.
+    3. Plain anonymous ``mmap`` + 4 KiB-stride pre-fault -- last-resort
+       fallback if ``MAP_POPULATE`` itself fails (e.g. the kernel refused
+       to populate up front). Slow for very large buffers but rare.
 
     Args:
         size: Requested allocation size in bytes.
@@ -301,11 +310,11 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
         Pointer to the pinned host allocation.
 
     Raises:
-        RuntimeError: If all three allocation paths fail, or pin fails.
+        RuntimeError: If all allocation paths fail, or pin fails.
     """
     hp_size = _align_hugepage(size)
 
-    # Tier 1: explicit hugetlb
+    # Tier 1: explicit hugetlb from the reserved pool.
     ptr = _libc.mmap(
         None,
         hp_size,
@@ -318,40 +327,41 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
         mmap_size = hp_size
         fault_stride = _HUGE_PAGE_SIZE
         mode = "hugetlb"
+        needs_prefault = True
         logger.info(
             "Explicit hugetlb mmap OK: size=%d (%.2f GB)",
             mmap_size, mmap_size / (1024**3),
         )
     else:
         hp_errno = ctypes.get_errno()
-        logger.info(
-            "Explicit hugetlb mmap failed (errno=%d), falling back to THP",
+        # Tier 2: MAP_POPULATE anonymous small pages (no madvise, no
+        # sync compaction). See docstring for rationale.
+        logger.warning(
+            "Explicit hugetlb mmap failed (errno=%d); falling back to "
+            "MAP_POPULATE small pages. H2D/D2H throughput will be "
+            "reduced (4 KiB pages, no hugepages).",
             hp_errno,
         )
-        # Tier 2: THP via madvise(MADV_HUGEPAGE)
+        mmap_size = _align_smallpage(size)
         ptr = _libc.mmap(
             None,
-            hp_size,
+            mmap_size,
             _PROT_READ_WRITE,
-            _MAP_PRIVATE_ANONYMOUS,
+            _MAP_PRIVATE_ANONYMOUS | _MAP_POPULATE,
             -1,
             0,
         )
         if ptr != ctypes.c_void_p(-1).value:
-            mmap_size = hp_size
-            fault_stride = _HUGE_PAGE_SIZE
-            mode = "THP"
+            mode = "populate"
+            needs_prefault = False
         else:
-            thp_errno = ctypes.get_errno()
-            # Tier 3: regular small pages
+            pop_errno = ctypes.get_errno()
+            # Tier 3: plain mmap + 4 KiB-stride pre-fault (last resort).
             logger.warning(
-                "THP mmap failed (errno=%d); falling back to regular "
-                "small pages. KV-transfer host buffers will use %d KiB "
-                "pages, which increases TLB pressure and may reduce "
-                "H2D/D2H throughput.",
-                thp_errno, _SMALL_PAGE_SIZE // 1024,
+                "MAP_POPULATE mmap failed (errno=%d); falling back to "
+                "plain mmap + 4 KiB pre-fault (slow for large buffers).",
+                pop_errno,
             )
-            mmap_size = _align_smallpage(size)
             ptr = _libc.mmap(
                 None,
                 mmap_size,
@@ -364,22 +374,23 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
                 raise RuntimeError(
                     f"mmap failed at all tiers "
                     f"(hugetlb errno={hp_errno}, "
-                    f"THP errno={thp_errno}, "
-                    f"smallpage errno={ctypes.get_errno()})"
+                    f"populate errno={pop_errno}, "
+                    f"plain errno={ctypes.get_errno()})"
                 )
             fault_stride = _SMALL_PAGE_SIZE
             mode = "smallpage"
+            needs_prefault = True
 
     pinned = False
     try:
         if numa_id is not None:
             _bind_numa(ptr, mmap_size, numa_id)
-        if mode == "THP":
-            _libc.madvise(ctypes.c_void_p(ptr), mmap_size, _MADV_HUGEPAGE)
-        # Touch one byte per page (huge or small) to fault the allocation
-        # in before registering it for DMA.
-        for offset in range(0, mmap_size, fault_stride):
-            ctypes.memset(ptr + offset, 0, 1)
+        if needs_prefault:
+            # Touch one byte per page to fault the allocation in before
+            # registering it for DMA. hugetlb faults come from the reserved
+            # pool (fast); Tier 3 small-page faults are 4 KiB each.
+            for offset in range(0, mmap_size, fault_stride):
+                ctypes.memset(ptr + offset, 0, 1)
         _pin_host_memory(ptr, mmap_size)
         pinned = True
     except Exception:
@@ -405,11 +416,13 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
         mode,
         "xpurt" if _libxpurt is not None else "cuda_cudart",
     )
-    if mode == "smallpage":
+    if mode in ("populate", "smallpage"):
         logger.warning(
-            "Host buffer at 0x%x is backed by small pages (no hugepages "
-            "available); expect reduced H2D/D2H throughput.",
+            "Host buffer at 0x%x is backed by %s (no reserved hugepages); "
+            "expect reduced H2D/D2H throughput.",
             ptr,
+            "MAP_POPULATE small pages" if mode == "populate"
+            else "4 KiB small pages",
         )
     return ptr
 
