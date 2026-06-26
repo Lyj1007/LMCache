@@ -338,8 +338,10 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
         # sync compaction). See docstring for rationale.
         logger.warning(
             "Explicit hugetlb mmap failed (errno=%d); falling back to "
-            "MAP_POPULATE small pages. H2D/D2H throughput will be "
-            "reduced (4 KiB pages, no hugepages).",
+            "MAP_POPULATE (no reserved hugepages). The kernel may still "
+            "deliver transparent huge pages where the buddy allocator has "
+            "free 2 MiB blocks (thp.enabled=always), but H2D/D2H "
+            "throughput may be reduced versus the reserved-pool path.",
             hp_errno,
         )
         mmap_size = _align_smallpage(size)
@@ -418,11 +420,14 @@ def _alloc_thp_pinned(size: int, numa_id: Optional[int] = None) -> int:
     )
     if mode in ("populate", "smallpage"):
         logger.warning(
-            "Host buffer at 0x%x is backed by %s (no reserved hugepages); "
-            "expect reduced H2D/D2H throughput.",
+            "Host buffer at 0x%x allocated via %s (no reserved hugepages). "
+            "Transparent huge pages may still cover part of the buffer "
+            "where the buddy allocator had free 2 MiB blocks; the rest is "
+            "4 KiB pages. H2D/D2H throughput may be reduced versus the "
+            "reserved-hugetlb path.",
             ptr,
-            "MAP_POPULATE small pages" if mode == "populate"
-            else "4 KiB small pages",
+            "MAP_POPULATE" if mode == "populate"
+            else "plain mmap + 4 KiB pre-fault",
         )
     return ptr
 
