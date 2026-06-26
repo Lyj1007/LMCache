@@ -964,13 +964,17 @@ class XpuTransferModule:
             elapsed = ed - st
             mib = total_bytes / (1024 * 1024)
             bw = total_bytes / elapsed / (1024**3) if elapsed > 0 else 0.0
+            l1_used, l1_total = self._ctx.storage_manager.l1_manager.get_memory_usage()
             logger.info(
-                "STORE_XPU stored %d tokens, %.1f MiB in %.3f s (%.1f GiB/s) (request_id=%s)",
+                "STORE_XPU stored %d tokens, %.1f MiB in %.3f s (%.1f GiB/s) "
+                "(request_id=%s, L1=%d/%d MiB)",
                 len(reserved_dict) * self._ctx.chunk_size,
                 mib,
                 elapsed,
                 bw,
                 key.request_id,
+                l1_used // (1024 * 1024),
+                l1_total // (1024 * 1024),
             )
         return True
 
@@ -1110,13 +1114,17 @@ class XpuTransferModule:
         elapsed = ed - st
         mib = total_bytes / (1024 * 1024)
         bw = total_bytes / elapsed / (1024**3) if elapsed > 0 else 0.0
+        l1_used, l1_total = self._ctx.storage_manager.l1_manager.get_memory_usage()
         logger.info(
-            "RETRIEVE_XPU retrieved %d tokens, %.1f MiB in %.3f s (%.1f GiB/s) (request_id=%s)",
+            "RETRIEVE_XPU retrieved %d tokens, %.1f MiB in %.3f s (%.1f GiB/s) "
+            "(request_id=%s, L1=%d/%d MiB)",
             len(obj_keys) * self._ctx.chunk_size,
             mib,
             elapsed,
             bw,
             key.request_id,
+            l1_used // (1024 * 1024),
+            l1_total // (1024 * 1024),
         )
         return True
 
