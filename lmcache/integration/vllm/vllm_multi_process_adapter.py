@@ -1539,7 +1539,16 @@ class LMCacheMPWorkerAdapter:
             if req_id in self.finished_stores or req_id in self.store_futures:
                 self.previously_finished.add(req_id)
             else:
-                ret_stores.add(req_id)
+                # This request has no pending or completed store. Skip it.
+                # The scheduler's deinit_te path (xvllm monkey-patch) can
+                # delete requests from self.requests at any time without
+                # notifying LMCache. Reporting a req_id as finished_sending
+                # after it has been deleted triggers
+                # `assert req_id in self.requests` (AssertionError) and
+                # crashes the EngineCore. Since this req_id has no store,
+                # the scheduler can free its blocks without waiting for
+                # a finished_sending confirmation.
+                pass
         ret_stores.update(self._update_and_get_finished_store())
         self._returned_finished.update(ret_stores)
         return ret_stores
@@ -1606,6 +1615,22 @@ class LMCacheMPWorkerAdapter:
             # first and deletes the request, so we must not also report it
             # in finished_sending.
             ret_stores -= finished_retrieves
+
+            # Filter finished_recving: requests in
+            # finished_req_ids_from_engine have already been freed
+            # by the scheduler's _free_request() which runs before
+            # _update_from_kv_xfer_finished().  Reporting them
+            # would crash EngineCore with AssertionError.
+            stale_retrieves = finished_retrieves & finished_req_ids_from_engine
+            if stale_retrieves:
+                logger.info(
+                    "get_finished (unhealthy): filtered %d req_ids "
+                    "from finished_recving that are in "
+                    "finished_req_ids_from_engine: %s",
+                    len(stale_retrieves), stale_retrieves,
+                )
+                finished_retrieves -= stale_retrieves
+
             return ret_stores, finished_retrieves
 
         finished_stores = set()
@@ -1672,6 +1697,27 @@ class LMCacheMPWorkerAdapter:
                 world_size=self.world_size,
                 kv_rank=self.worker_id,
             )
+
+        # --- Filter finished_recving ---
+        # The vLLM scheduler frees requests (del self.requests[req_id])
+        # via _free_request() BEFORE it processes _update_from_kv_xfer_finished().
+        # Any req_id in finished_req_ids_from_engine has already been freed
+        # by the time the scheduler iterates finished_recving, so reporting
+        # it would trigger `assert req_id in self.requests` (AssertionError)
+        # and crash the EngineCore.
+        #
+        # WAITING_FOR_REMOTE_KVS requests are NOT in
+        # finished_req_ids_from_engine (they have not completed generation),
+        # so they survive this filter and can be properly unblocked.
+        stale_retrieves = finished_retrieves & finished_req_ids_from_engine
+        if stale_retrieves:
+            logger.info(
+                "get_finished: filtered %d req_ids from finished_recving "
+                "that are in finished_req_ids_from_engine (scheduler "
+                "already freed them): %s",
+                len(stale_retrieves), stale_retrieves,
+            )
+            finished_retrieves -= stale_retrieves
 
         return ret_stores, finished_retrieves
 

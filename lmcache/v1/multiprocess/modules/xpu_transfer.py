@@ -290,6 +290,10 @@ class XpuInstanceEntry:
     compact_buf: Optional[torch.Tensor] = None
     # Pre-allocated compact buffer for slow-path retrieve H2D.
     retrieve_compact_buf: Optional[torch.Tensor] = None
+    # Set to True when the entry is superseded by a re-registration.
+    # Concurrent store/retrieve operations check this flag under their
+    # per-entry lock and bail out gracefully if set.
+    invalidated: bool = False
 
 
 class XpuTransferModule:
@@ -553,17 +557,22 @@ class XpuTransferModule:
                     "previous entry before re-registering",
                     payload.instance_id,
                 )
-                # Drop the old entry's resources (remote tensor views,
-                # local device buffer, locks) before overwriting; without
-                # this the new entry shadows the buffer and the old one
-                # leaks until the server itself shuts down.
+                # Mark the old entry as invalidated so that any in-flight
+                # store/retrieve operations will bail out gracefully once
+                # they observe the flag under their per-entry lock.  We
+                # must NOT call .clear() on the entry's mutable lists
+                # (groups, remote_layer_tensors, etc.) because a
+                # concurrent store or retrieve may still hold a reference
+                # to this entry and be iterating over those lists.  The
+                # stale entry will be released by the GC once all
+                # in-flight operations complete.
                 stale = self._instances.pop(payload.instance_id)
+                stale.invalidated = True
                 self._ctx.layout_desc_registry.unregister(
                     stale.model_name, stale.world_size
                 )
-                stale.remote_layer_tensors.clear()
-                stale.layer_handles.clear()
-                stale.groups.clear()
+                # Release GPU device buffers eagerly (these are single
+                # references, not iterables, so assigning None is safe).
                 stale.local_device_buffer = None
 
             device_index = torch_dev.current_device()
@@ -905,7 +914,12 @@ class XpuTransferModule:
         st = time.perf_counter()
         entry = self._instances.get(instance_id)
         if entry is None:
-            raise ValueError(f"No XPU instance registered for id={instance_id}")
+            logger.warning(
+                "STORE_XPU skipped: no XPU instance registered for "
+                "id=%s (request_id=%s)",
+                instance_id, key.request_id,
+            )
+            return False
 
         obj_keys = self._ctx.resolve_obj_keys(key)
         if not obj_keys:
@@ -929,6 +943,13 @@ class XpuTransferModule:
         store_succeeded = False
         try:
             with entry.store_lock:
+                if entry.invalidated:
+                    logger.warning(
+                        "STORE_XPU skipped: XPU instance %d was "
+                        "invalidated (re-registered); request_id=%s",
+                        instance_id, key.request_id,
+                    )
+                    return False
                 layout_desc = _layout_desc_from_groups(
                     entry.groups, entry.layer_handles
                 )
@@ -940,13 +961,29 @@ class XpuTransferModule:
                     memory_obj = reserved_dict.get(obj_key)
                     if memory_obj is None:
                         continue
+                    _copy_st = time.perf_counter()
                     self._copy_chunk_to_memory_obj(
                         entry, chunk_idx, block_ids, memory_obj
                     )
+                    _copy_elapsed = time.perf_counter() - _copy_st
+                    if _copy_elapsed > 1.0:
+                        logger.warning(
+                            "STORE_XPU slow copy chunk_idx=%d "
+                            "request_id=%s elapsed=%.3f s",
+                            chunk_idx, key.request_id, _copy_elapsed,
+                        )
                 # Sync after D2H copies to ensure data integrity.
                 event = torch_dev.Event()
                 event.record(torch_dev.current_stream(entry.device))
+                _sync_st = time.perf_counter()
                 event.synchronize()
+                _sync_elapsed = time.perf_counter() - _sync_st
+                if _sync_elapsed > 1.0:
+                    logger.warning(
+                        "STORE_XPU slow D2H sync request_id=%s "
+                        "elapsed=%.3f s",
+                        key.request_id, _sync_elapsed,
+                    )
                 store_succeeded = True
         except Exception:
             logger.exception("STORE_XPU failed for request_id=%s", key.request_id)
@@ -995,6 +1032,12 @@ class XpuTransferModule:
         """
         if _gather_op is None or entry.store_staging_buffer is None:
             return
+        if entry.invalidated:
+            logger.warning(
+                "_copy_chunk_to_memory_obj skipped: entry for "
+                "instance pid=%d is invalidated", entry.tp_rank,
+            )
+            return
         num_groups = len(entry.groups)
         for gi in range(num_groups):
             bpc = entry.groups[gi].blocks_per_chunk
@@ -1017,6 +1060,7 @@ class XpuTransferModule:
             staging_view = entry.store_staging_buffer[:nl * n_blocks * max_page].view(
                 nl, n_blocks, max_page
             )
+            _gather_st = time.perf_counter()
             _gather_op(
                 entry.group_layer_tensors_int8[gi],
                 staging_view,
@@ -1026,6 +1070,13 @@ class XpuTransferModule:
                 entry.layers_scalars_tensors[gi],
                 paged_buffer_ptrs_dev=entry.paged_buffer_ptrs_devs[gi],
             )
+            _gather_elapsed = time.perf_counter() - _gather_st
+            if _gather_elapsed > 1.0:
+                logger.warning(
+                    "STORE_XPU slow gather gi=%d chunk_idx=%d "
+                    "elapsed=%.3f s",
+                    gi, chunk_idx, _gather_elapsed,
+                )
 
             # Copy staging → host MemoryObj per-group tensor (padded layout)
             dst_tensor = memory_obj.get_tensor(gi)
@@ -1033,7 +1084,15 @@ class XpuTransferModule:
                 dst_flat = dst_tensor.view(-1)
                 padded_bytes = nl * n_blocks * max_page
                 try:
+                    _d2h_st = time.perf_counter()
                     dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes])
+                    _d2h_elapsed = time.perf_counter() - _d2h_st
+                    if _d2h_elapsed > 1.0:
+                        logger.warning(
+                            "STORE_XPU slow D2H copy gi=%d chunk_idx=%d "
+                            "elapsed=%.3f s",
+                            gi, chunk_idx, _d2h_elapsed,
+                        )
                 except RuntimeError as e:
                     logger.error(
                         "D2H copy failed: gi=%d nl=%d n_blocks=%d max_page=%d "
@@ -1071,7 +1130,12 @@ class XpuTransferModule:
         st = time.perf_counter()
         entry = self._instances.get(instance_id)
         if entry is None:
-            raise ValueError(f"No XPU instance registered for id={instance_id}")
+            logger.warning(
+                "RETRIEVE_XPU skipped: no XPU instance registered for "
+                "id=%s (request_id=%s)",
+                instance_id, key.request_id,
+            )
+            return False
 
         obj_keys = self._ctx.resolve_obj_keys(key)
         if not obj_keys:
@@ -1084,6 +1148,13 @@ class XpuTransferModule:
             with entry.retrieve_lock, self._ctx.storage_manager.read_prefetched_results(
                 obj_keys
             ) as memory_objs:
+                if entry.invalidated:
+                    logger.warning(
+                        "RETRIEVE_XPU skipped: XPU instance %d was "
+                        "invalidated (re-registered); request_id=%s",
+                        instance_id, key.request_id,
+                    )
+                    return False
                 if not memory_objs or len(memory_objs) != len(obj_keys):
                     logger.warning(
                         "RETRIEVE_XPU miss request_id=%s expected=%d got=%d",
@@ -1147,6 +1218,12 @@ class XpuTransferModule:
         """
         if _scatter_op is None or entry.retrieve_staging_buffer is None:
             return
+        if entry.invalidated:
+            logger.warning(
+                "_copy_memory_obj_to_chunk skipped: entry for "
+                "instance pid=%d is invalidated", entry.tp_rank,
+            )
+            return
         num_groups = len(entry.groups)
         for gi in range(num_groups):
             bpc = entry.groups[gi].blocks_per_chunk
@@ -1168,9 +1245,19 @@ class XpuTransferModule:
             src_flat = src_tensor.view(-1)
             # Host now stores padded layout — single bulk H2D copy.
             padded_bytes = nl * n_blocks * max_page
-            staging_view.view(-1)[:padded_bytes].copy_(
-                src_flat[:padded_bytes]
-            )
+            try:
+                staging_view.view(-1)[:padded_bytes].copy_(
+                    src_flat[:padded_bytes]
+                )
+            except RuntimeError as e:
+                logger.error(
+                    "H2D copy failed: gi=%d nl=%d n_blocks=%d "
+                    "max_page=%d padded_bytes=%d "
+                    "staging_size=%d err=%s",
+                    gi, nl, n_blocks, max_page, padded_bytes,
+                    staging_view.numel(), e,
+                )
+                raise
 
             # Reuse pre-allocated retrieve block_ids buffer
             if entry.retrieve_block_ids_buffer is not None and n_blocks <= entry.retrieve_block_ids_buffer.numel():
