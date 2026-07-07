@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
 import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -1092,6 +1093,16 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
+        # Track submission time for store futures to detect stalls.
+        self._store_submit_times: dict[str, float] = {}
+
+        # Maximum seconds to wait for a store future before force-reporting
+        # it as finished_sending.  Prevents GPU KV cache exhaustion when
+        # the LMCache server clears objects out from under an in-flight
+        # store (clear(force=True)) or when the store is slow.
+        self._store_timeout_seconds: float = float(
+            os.environ.get("LMCACHE_STORE_TIMEOUT_SECONDS", "120")
+        )
         # The IPC handle is not enough by itself; CUDA needs the exporting
         # event object to stay alive until the consumer is done with it.
         self.store_events: dict[str, _IpcEvent] = {}
@@ -1416,6 +1427,7 @@ class LMCacheMPWorkerAdapter:
             self.blocks_in_chunk,
         )
         self.store_futures[request_id] = future
+        self._store_submit_times[request_id] = time.monotonic()
         self.store_events[request_id] = event
 
     @_lmcache_nvtx_annotate
@@ -1596,6 +1608,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.clear()
             self.store_events.clear()
             self.retrieve_events.clear()
+            self._store_submit_times.clear()
 
             # Retrieves dropped at submit time still must be reported,
             # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
@@ -1635,8 +1648,32 @@ class LMCacheMPWorkerAdapter:
 
         finished_stores = set()
         finished_retrieves = set()
-        for request_id, s_future in self.store_futures.items():
+        for request_id, s_future in list(self.store_futures.items()):
             if not s_future.query():
+                # Check for timed-out store futures.  When the LMCache
+                # server clears objects (clear(force=True)) out from under
+                # an in-flight store, or when the store is extremely slow,
+                # the future may never complete.  The vLLM scheduler
+                # delays freeing GPU blocks until finished_sending arrives,
+                # so a stuck store exhausts GPU KV cache and hangs the
+                # engine.  Force-report the request as finished_sending
+                # after the timeout so the scheduler can reclaim blocks.
+                submit_time = self._store_submit_times.get(request_id)
+                if submit_time is not None:
+                    elapsed = time.monotonic() - submit_time
+                    if elapsed > self._store_timeout_seconds:
+                        logger.warning(
+                            "Store future for request_id=%s timed out "
+                            "after %.1fs (limit=%.1fs), force-reporting "
+                            "as finished_sending to prevent GPU KV cache "
+                            "stall",
+                            request_id,
+                            elapsed,
+                            self._store_timeout_seconds,
+                        )
+                        finished_stores.add(request_id)
+                        if not s_future.is_done_.is_set():
+                            s_future.set_result(False)
                 continue
 
             s_result = s_future.result(timeout=60)
@@ -1668,6 +1705,7 @@ class LMCacheMPWorkerAdapter:
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
             self.store_events.pop(request_id, None)
+            self._store_submit_times.pop(request_id, None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
