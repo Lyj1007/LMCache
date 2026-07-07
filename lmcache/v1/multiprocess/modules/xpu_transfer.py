@@ -1241,37 +1241,10 @@ class XpuTransferModule:
                 nl, n_blocks, max_page
             )
             if src_tensor is None:
-                logger.warning(
-                    "H2D src_tensor is None: gi=%d chunk_idx=%d "
-                    "obj_valid=%s obj_meta=%s",
-                    gi, chunk_idx,
-                    getattr(memory_obj, "valid", "?"),
-                    getattr(memory_obj, "meta", "?"),
-                )
                 continue
             src_flat = src_tensor.view(-1)
             # Host now stores padded layout — single bulk H2D copy.
             padded_bytes = nl * n_blocks * max_page
-            if src_flat.numel() < padded_bytes:
-                logger.warning(
-                    "H2D src too small: gi=%d nl=%d n_blocks=%d "
-                    "max_page=%d src_numel=%d padded_bytes=%d "
-                    "staging_numel=%d chunk_idx=%d bpc=%d "
-                    "block_ids_len=%d",
-                    gi, nl, n_blocks, max_page,
-                    src_flat.numel(), padded_bytes,
-                    staging_view.numel(), chunk_idx, bpc,
-                    len(block_ids[gi]),
-                )
-            if staging_view.numel() < padded_bytes:
-                logger.warning(
-                    "H2D staging too small: gi=%d nl=%d n_blocks=%d "
-                    "max_page=%d staging_numel=%d padded_bytes=%d "
-                    "staging_buf_numel=%d",
-                    gi, nl, n_blocks, max_page,
-                    staging_view.numel(), padded_bytes,
-                    entry.retrieve_staging_buffer.numel(),
-                )
             try:
                 staging_view.view(-1)[:padded_bytes].copy_(
                     src_flat[:padded_bytes]
@@ -1279,11 +1252,10 @@ class XpuTransferModule:
             except RuntimeError as e:
                 logger.error(
                     "H2D copy failed: gi=%d nl=%d n_blocks=%d "
-                    "max_page=%d padded_bytes=%d src_numel=%d "
-                    "staging_size=%d chunk_idx=%d bpc=%d err=%s",
+                    "max_page=%d padded_bytes=%d "
+                    "staging_size=%d err=%s",
                     gi, nl, n_blocks, max_page, padded_bytes,
-                    src_flat.numel(), staging_view.numel(),
-                    chunk_idx, bpc, e,
+                    staging_view.numel(), e,
                 )
                 raise
 
