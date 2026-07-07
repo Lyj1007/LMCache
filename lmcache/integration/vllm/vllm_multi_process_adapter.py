@@ -1551,16 +1551,18 @@ class LMCacheMPWorkerAdapter:
             if req_id in self.finished_stores or req_id in self.store_futures:
                 self.previously_finished.add(req_id)
             else:
-                # This request has no pending or completed store. Skip it.
-                # The scheduler's deinit_te path (xvllm monkey-patch) can
-                # delete requests from self.requests at any time without
-                # notifying LMCache. Reporting a req_id as finished_sending
-                # after it has been deleted triggers
-                # `assert req_id in self.requests` (AssertionError) and
-                # crashes the EngineCore. Since this req_id has no store,
-                # the scheduler can free its blocks without waiting for
-                # a finished_sending confirmation.
-                pass
+                # This request has no pending or completed store.
+                # Return it as finished_sending so the scheduler can
+                # free its GPU blocks.  Previously this was skipped
+                # (pass) to avoid AssertionError when xvllm's
+                # deinit_te monkey-patch deleted the request from
+                # self.requests before _update_from_kv_xfer_finished
+                # ran.  However, skipping means blocks are never freed
+                # → GPU KV cache exhaustion deadlock.  The crash is now
+                # prevented by filtering finished_sending against
+                # already-freed request IDs in the scheduler
+                # (xvllm monkey-patch on _update_from_kv_xfer_finished).
+                ret_stores.add(req_id)
         ret_stores.update(self._update_and_get_finished_store())
         self._returned_finished.update(ret_stores)
         return ret_stores
