@@ -418,6 +418,7 @@ class XPUDevicePtrTransferContext(TransferContext):
                 groups=groups,
                 gpu_kv_format=int(gpu_kv_format),
                 l1_pool_request_size=int(l1_pool_request_size),
+                device_index=int(torch_dev.current_device()),
             )
 
             future = send_request(

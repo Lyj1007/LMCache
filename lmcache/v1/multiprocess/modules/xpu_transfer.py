@@ -497,7 +497,8 @@ class XpuTransferModule:
             )
 
     def _allocate_local_device_buffer(
-        self, groups: list[XpuGroupView], layer_handles: list[XpuLayerHandle]
+        self, groups: list[XpuGroupView], layer_handles: list[XpuLayerHandle],
+        device: torch.device,
     ) -> Optional[torch.Tensor]:
         """Allocate a per-group staging device buffer for D2D gather/scatter.
 
@@ -506,6 +507,7 @@ class XpuTransferModule:
         Args:
             groups: Per-group metadata.
             layer_handles: Layer handles (used for dtype lookup).
+            device: Device on which to allocate the buffer (worker's GPU).
 
         Returns:
             A 1D ``torch.Tensor`` sized for the largest per-chunk group,
@@ -529,9 +531,6 @@ class XpuTransferModule:
                 slot_dtype = group_dtype.get(g.group_id, torch.float16)
         if max_slots <= 0:
             return None
-        device = torch.device(
-            f"{torch_device_type}:{torch_dev.current_device()}"
-        )
         return torch.empty(max_slots, dtype=slot_dtype, device=device)
 
     def register_xpu_kv_cache(
@@ -575,7 +574,7 @@ class XpuTransferModule:
                 # references, not iterables, so assigning None is safe).
                 stale.local_device_buffer = None
 
-            device_index = torch_dev.current_device()
+            device_index = payload.device_index
             device = torch.device(f"{torch_device_type}:{device_index}")
 
             remote_layer_tensors: list[torch.Tensor] = []
@@ -587,7 +586,7 @@ class XpuTransferModule:
             )
 
             local_device_buffer = self._allocate_local_device_buffer(
-                payload.groups, payload.layer_handles
+                payload.groups, payload.layer_handles, device
             )
 
             # Build per-group kernel metadata for gather/scatter
@@ -646,7 +645,8 @@ class XpuTransferModule:
 
             logger.info(
                 "Registered XPU KV cache instance=%d model=%s world_size=%d "
-                "tp=%d/%d num_layers=%d num_groups=%d broadcast_bytes=%d",
+                "tp=%d/%d num_layers=%d num_groups=%d broadcast_bytes=%d "
+                "device=%d",
                 payload.instance_id,
                 payload.model_name,
                 payload.world_size,
@@ -655,6 +655,7 @@ class XpuTransferModule:
                 len(payload.layer_handles),
                 len(payload.groups),
                 broadcast_buffer_bytes,
+                device_index,
             )
 
             return RegisterXpuContextResponse(
@@ -957,33 +958,41 @@ class XpuTransferModule:
                     obj_keys, layout_desc, "new"
                 )
 
-                for chunk_idx, obj_key in enumerate(obj_keys):
-                    memory_obj = reserved_dict.get(obj_key)
-                    if memory_obj is None:
-                        continue
-                    _copy_st = time.perf_counter()
-                    self._copy_chunk_to_memory_obj(
-                        entry, chunk_idx, block_ids, memory_obj
-                    )
-                    _copy_elapsed = time.perf_counter() - _copy_st
-                    if _copy_elapsed > 1.0:
-                        logger.warning(
-                            "STORE_XPU slow copy chunk_idx=%d "
-                            "request_id=%s elapsed=%.3f s",
-                            chunk_idx, key.request_id, _copy_elapsed,
+                # Device guard: the server process serves multiple DP workers
+                # concurrently on different XPU devices.  The custom gather
+                # kernel uses the current device context, so we must set it
+                # to the worker's device (TP0's device index per DP group)
+                # before issuing any GPU operation.  Without this, a DP1
+                # request can execute its gather on DP0's device, causing
+                # cross-GPU writes (see TP4 DP2 precision fix).
+                with torch_dev.device(entry.device):
+                    for chunk_idx, obj_key in enumerate(obj_keys):
+                        memory_obj = reserved_dict.get(obj_key)
+                        if memory_obj is None:
+                            continue
+                        _copy_st = time.perf_counter()
+                        self._copy_chunk_to_memory_obj(
+                            entry, chunk_idx, block_ids, memory_obj
                         )
-                # Sync after D2H copies to ensure data integrity.
-                event = torch_dev.Event()
-                event.record(torch_dev.current_stream(entry.device))
-                _sync_st = time.perf_counter()
-                event.synchronize()
-                _sync_elapsed = time.perf_counter() - _sync_st
-                if _sync_elapsed > 1.0:
-                    logger.warning(
-                        "STORE_XPU slow D2H sync request_id=%s "
-                        "elapsed=%.3f s",
-                        key.request_id, _sync_elapsed,
-                    )
+                        _copy_elapsed = time.perf_counter() - _copy_st
+                        if _copy_elapsed > 1.0:
+                            logger.warning(
+                                "STORE_XPU slow copy chunk_idx=%d "
+                                "request_id=%s elapsed=%.3f s",
+                                chunk_idx, key.request_id, _copy_elapsed,
+                            )
+                    # Sync after D2H copies to ensure data integrity.
+                    event = torch_dev.Event()
+                    event.record(torch_dev.current_stream(entry.device))
+                    _sync_st = time.perf_counter()
+                    event.synchronize()
+                    _sync_elapsed = time.perf_counter() - _sync_st
+                    if _sync_elapsed > 1.0:
+                        logger.warning(
+                            "STORE_XPU slow D2H sync request_id=%s "
+                            "elapsed=%.3f s",
+                            key.request_id, _sync_elapsed,
+                        )
                 # Re-check invalidated after copy loop: if the entry was
                 # invalidated mid-copy, some chunks may have been skipped
                 # by _copy_chunk_to_memory_obj, leaving MemoryObjs with
@@ -996,16 +1005,6 @@ class XpuTransferModule:
                         len(reserved_dict), key.request_id,
                     )
                     return False
-                # Diagnostic: log checksum of each MemoryObj to detect
-                # data corruption between store and retrieve.
-                for _ck, _mo in reserved_dict.items():
-                    _t = _mo.get_tensor(0)
-                    _cksum = float(_t[:min(256, _t.numel())].float().sum())
-                    logger.info(
-                        "STORE_XPU checksum chunk_obj=%s first256_sum=%.4f "
-                        "request_id=%s",
-                        _ck, _cksum, key.request_id,
-                    )
                 store_succeeded = True
         except Exception:
             logger.exception("STORE_XPU failed for request_id=%s", key.request_id)
@@ -1186,25 +1185,21 @@ class XpuTransferModule:
                     )
                     return False
                 prefetched_keys = obj_keys[: len(memory_objs)]
-                for chunk_idx, memory_obj in enumerate(memory_objs):
-                    total_bytes += memory_obj.get_size()
-                    # Diagnostic: log checksum before H2D copy to compare
-                    # with store-side checksum.
-                    _t = memory_obj.get_tensor(0)
-                    _cksum = float(_t[:min(256, _t.numel())].float().sum())
-                    logger.info(
-                        "RETRIEVE_XPU checksum chunk_idx=%d first256_sum=%.4f "
-                        "request_id=%s",
-                        chunk_idx, _cksum, key.request_id,
-                    )
-                    self._copy_memory_obj_to_chunk(
-                        entry,
-                        chunk_idx,
-                        block_ids,
-                        memory_obj,
-                        skip_blocks_per_group,
-                        key.request_id,
-                    )
+                # Device guard: same rationale as store_xpu — the scatter
+                # kernel must execute on the worker's device (TP0's device
+                # index per DP group), not whichever device another DP
+                # worker's request last set as current.
+                with torch_dev.device(entry.device):
+                    for chunk_idx, memory_obj in enumerate(memory_objs):
+                        total_bytes += memory_obj.get_size()
+                        self._copy_memory_obj_to_chunk(
+                            entry,
+                            chunk_idx,
+                            block_ids,
+                            memory_obj,
+                            skip_blocks_per_group,
+                            key.request_id,
+                        )
                 # If the request was cancelled mid-scatter (e.g.
                 # end_session arrived from the scheduler), some groups
                 # may have been skipped by _copy_memory_obj_to_chunk.

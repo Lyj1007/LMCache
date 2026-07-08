@@ -208,6 +208,10 @@ class RegisterXpuContextPayload(msgspec.Struct):
             ``scatter_multi_layer_block_kv_transfer``.
         l1_pool_request_size: Bytes of L1 SHM pool the worker requests for
             its D2H targets. ``0`` means "use server default".
+        device_index: Worker's XPU device index. The server allocates
+            staging buffers and runs gather/scatter kernels on this device
+            to avoid cross-GPU writes that can cause cache-coherence
+            issues in multi-DP configurations.
     """
 
     instance_id: int
@@ -219,6 +223,7 @@ class RegisterXpuContextPayload(msgspec.Struct):
     groups: list[XpuGroupView]
     gpu_kv_format: int
     l1_pool_request_size: int = 0
+    device_index: int = 0
 
 
 @dataclass
