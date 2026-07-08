@@ -966,13 +966,26 @@ class XpuTransferModule:
                 # request can execute its gather on DP0's device, causing
                 # cross-GPU writes (see TP4 DP2 precision fix).
                 with torch_dev.device(entry.device):
+                    # Pre-upload all block_ids to device once via pinned
+                    # memory so the H2D copy is async (non_blocking=True).
+                    block_ids_dev_per_group = []
+                    for gi in range(num_groups):
+                        cpu_pinned = torch.tensor(
+                            block_ids[gi], dtype=torch.int64, pin_memory=True
+                        )
+                        dev_t = torch.empty(
+                            len(block_ids[gi]), dtype=torch.int64,
+                            device=entry.device,
+                        )
+                        dev_t.copy_(cpu_pinned, non_blocking=True)
+                        block_ids_dev_per_group.append(dev_t)
                     for chunk_idx, obj_key in enumerate(obj_keys):
                         memory_obj = reserved_dict.get(obj_key)
                         if memory_obj is None:
                             continue
                         _copy_st = time.perf_counter()
                         self._copy_chunk_to_memory_obj(
-                            entry, chunk_idx, block_ids, memory_obj
+                            entry, chunk_idx, block_ids_dev_per_group, memory_obj
                         )
                         _copy_elapsed = time.perf_counter() - _copy_st
                         if _copy_elapsed > 1.0:
@@ -1040,7 +1053,7 @@ class XpuTransferModule:
         self,
         entry: XpuInstanceEntry,
         chunk_idx: int,
-        block_ids: list[list[int]],
+        block_ids_dev_per_group: list[torch.Tensor],
         memory_obj: MemoryObj,
     ) -> None:
         """D2H copy one chunk's KV data from peer device pointers into SHM.
@@ -1048,7 +1061,8 @@ class XpuTransferModule:
         Args:
             entry: Registered XPU instance metadata.
             chunk_idx: Index into ``obj_keys`` (chunk position).
-            block_ids: Per-group paged block ids (full request).
+            block_ids_dev_per_group: Per-group block ids pre-uploaded to
+                device (full request).
             memory_obj: Destination L1 SHM-backed memory slot.
         """
         if _gather_op is None or entry.store_staging_buffer is None:
@@ -1064,20 +1078,11 @@ class XpuTransferModule:
             bpc = entry.groups[gi].blocks_per_chunk
             chunk_start = chunk_idx * bpc
             chunk_end = chunk_start + bpc
-            group_block_ids = block_ids[gi][chunk_start:chunk_end]
+            block_ids_dev = block_ids_dev_per_group[gi][chunk_start:chunk_end]
             nl = len(entry.group_layer_tensors_int8[gi])
             max_page = entry.max_page_size_per_group[gi]
             page_sizes = entry.layer_page_sizes_per_group[gi]
-            n_blocks = len(group_block_ids)
-
-            # Reuse pre-allocated store block_ids buffer
-            if entry.store_block_ids_buffer is not None and n_blocks <= entry.store_block_ids_buffer.numel():
-                block_ids_dev = entry.store_block_ids_buffer[:n_blocks]
-                block_ids_dev.copy_(torch.tensor(group_block_ids, dtype=torch.int64))
-            else:
-                block_ids_dev = torch.tensor(
-                    group_block_ids, dtype=torch.int64, device=entry.device
-                )
+            n_blocks = chunk_end - chunk_start
             staging_view = entry.store_staging_buffer[:nl * n_blocks * max_page].view(
                 nl, n_blocks, max_page
             )
@@ -1106,7 +1111,7 @@ class XpuTransferModule:
                 padded_bytes = nl * n_blocks * max_page
                 try:
                     _d2h_st = time.perf_counter()
-                    dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes])
+                    dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes], non_blocking=True)
                     _d2h_elapsed = time.perf_counter() - _d2h_st
                     if _d2h_elapsed > 1.0:
                         logger.warning(
@@ -1190,12 +1195,26 @@ class XpuTransferModule:
                 # index per DP group), not whichever device another DP
                 # worker's request last set as current.
                 with torch_dev.device(entry.device):
+                    # Pre-upload all block_ids to device once via pinned
+                    # memory so the H2D copy is async (non_blocking=True).
+                    num_groups = len(entry.groups)
+                    block_ids_dev_per_group = []
+                    for gi in range(num_groups):
+                        cpu_pinned = torch.tensor(
+                            block_ids[gi], dtype=torch.int64, pin_memory=True
+                        )
+                        dev_t = torch.empty(
+                            len(block_ids[gi]), dtype=torch.int64,
+                            device=entry.device,
+                        )
+                        dev_t.copy_(cpu_pinned, non_blocking=True)
+                        block_ids_dev_per_group.append(dev_t)
                     for chunk_idx, memory_obj in enumerate(memory_objs):
                         total_bytes += memory_obj.get_size()
                         self._copy_memory_obj_to_chunk(
                             entry,
                             chunk_idx,
-                            block_ids,
+                            block_ids_dev_per_group,
                             memory_obj,
                             skip_blocks_per_group,
                             key.request_id,
@@ -1242,7 +1261,7 @@ class XpuTransferModule:
         self,
         entry: XpuInstanceEntry,
         chunk_idx: int,
-        block_ids: list[list[int]],
+        block_ids_dev_per_group: list[torch.Tensor],
         memory_obj: MemoryObj,
         skip_blocks_per_group: list[int],
         request_id: str,
@@ -1252,7 +1271,8 @@ class XpuTransferModule:
         Args:
             entry: Registered XPU instance metadata.
             chunk_idx: Index into ``obj_keys`` (chunk position).
-            block_ids: Per-group paged block ids (full request).
+            block_ids_dev_per_group: Per-group block ids pre-uploaded to
+                device (full request).
             memory_obj: Source L1 SHM-backed memory slot.
             skip_blocks_per_group: APC overlap guard, applied to chunk 0.
             request_id: Request identifier for cancel checking.
@@ -1283,11 +1303,11 @@ class XpuTransferModule:
             bpc = entry.groups[gi].blocks_per_chunk
             chunk_start = chunk_idx * bpc
             chunk_end = chunk_start + bpc
-            group_block_ids = block_ids[gi][chunk_start:chunk_end]
+            block_ids_dev = block_ids_dev_per_group[gi][chunk_start:chunk_end]
             nl = len(entry.group_layer_tensors_int8[gi])
             max_page = entry.max_page_size_per_group[gi]
             page_sizes = entry.layer_page_sizes_per_group[gi]
-            n_blocks = len(group_block_ids)
+            n_blocks = chunk_end - chunk_start
 
             # Copy host MemoryObj per-group tensor → staging buffer (H2D)
             src_tensor = memory_obj.get_tensor(gi)
@@ -1319,7 +1339,7 @@ class XpuTransferModule:
                 )
             try:
                 staging_view.view(-1)[:padded_bytes].copy_(
-                    src_flat[:padded_bytes]
+                    src_flat[:padded_bytes], non_blocking=True
                 )
             except RuntimeError as e:
                 logger.error(
@@ -1331,14 +1351,6 @@ class XpuTransferModule:
                 )
                 raise
 
-            # Reuse pre-allocated retrieve block_ids buffer
-            if entry.retrieve_block_ids_buffer is not None and n_blocks <= entry.retrieve_block_ids_buffer.numel():
-                block_ids_dev = entry.retrieve_block_ids_buffer[:n_blocks]
-                block_ids_dev.copy_(torch.tensor(group_block_ids, dtype=torch.int64))
-            else:
-                block_ids_dev = torch.tensor(
-                    group_block_ids, dtype=torch.int64, device=entry.device
-                )
             skip_n = 0
             if chunk_idx == 0 and gi < len(skip_blocks_per_group):
                 skip_n = skip_blocks_per_group[gi]
