@@ -984,6 +984,28 @@ class XpuTransferModule:
                         "elapsed=%.3f s",
                         key.request_id, _sync_elapsed,
                     )
+                # Re-check invalidated after copy loop: if the entry was
+                # invalidated mid-copy, some chunks may have been skipped
+                # by _copy_chunk_to_memory_obj, leaving MemoryObjs with
+                # uninitialized data.  Do NOT commit in that case —
+                # finish_write would make garbage visible to retrieves.
+                if entry.invalidated:
+                    logger.warning(
+                        "STORE_XPU entry invalidated mid-copy, not "
+                        "committing %d chunks (request_id=%s)",
+                        len(reserved_dict), key.request_id,
+                    )
+                    return False
+                # Diagnostic: log checksum of each MemoryObj to detect
+                # data corruption between store and retrieve.
+                for _ck, _mo in reserved_dict.items():
+                    _t = _mo.get_tensor(0)
+                    _cksum = float(_t[:min(256, _t.numel())].float().sum())
+                    logger.info(
+                        "STORE_XPU checksum chunk_obj=%s first256_sum=%.4f "
+                        "request_id=%s",
+                        _ck, _cksum, key.request_id,
+                    )
                 store_succeeded = True
         except Exception:
             logger.exception("STORE_XPU failed for request_id=%s", key.request_id)
@@ -1166,13 +1188,35 @@ class XpuTransferModule:
                 prefetched_keys = obj_keys[: len(memory_objs)]
                 for chunk_idx, memory_obj in enumerate(memory_objs):
                     total_bytes += memory_obj.get_size()
+                    # Diagnostic: log checksum before H2D copy to compare
+                    # with store-side checksum.
+                    _t = memory_obj.get_tensor(0)
+                    _cksum = float(_t[:min(256, _t.numel())].float().sum())
+                    logger.info(
+                        "RETRIEVE_XPU checksum chunk_idx=%d first256_sum=%.4f "
+                        "request_id=%s",
+                        chunk_idx, _cksum, key.request_id,
+                    )
                     self._copy_memory_obj_to_chunk(
                         entry,
                         chunk_idx,
                         block_ids,
                         memory_obj,
                         skip_blocks_per_group,
+                        key.request_id,
                     )
+                # If the request was cancelled mid-scatter (e.g.
+                # end_session arrived from the scheduler), some groups
+                # may have been skipped by _copy_memory_obj_to_chunk.
+                # Do NOT report success — the GPU blocks would have
+                # stale/uninitialized KV, causing garbage output.
+                if self._ctx.is_cancelled(key.request_id):
+                    logger.warning(
+                        "RETRIEVE_XPU cancelled mid-scatter, not "
+                        "reporting success (request_id=%s)",
+                        key.request_id,
+                    )
+                    return False
                 retrieve_succeeded = True
         except Exception:
             logger.exception("RETRIEVE_XPU failed for request_id=%s", key.request_id)
@@ -1206,6 +1250,7 @@ class XpuTransferModule:
         block_ids: list[list[int]],
         memory_obj: MemoryObj,
         skip_blocks_per_group: list[int],
+        request_id: str,
     ) -> None:
         """H2D copy one chunk's KV data from SHM back to peer device pointers.
 
@@ -1215,6 +1260,7 @@ class XpuTransferModule:
             block_ids: Per-group paged block ids (full request).
             memory_obj: Source L1 SHM-backed memory slot.
             skip_blocks_per_group: APC overlap guard, applied to chunk 0.
+            request_id: Request identifier for cancel checking.
         """
         if _scatter_op is None or entry.retrieve_staging_buffer is None:
             return
@@ -1226,6 +1272,19 @@ class XpuTransferModule:
             return
         num_groups = len(entry.groups)
         for gi in range(num_groups):
+            # ---- Cancel guard ------------------------------------------------
+            # If the request was aborted after retrieve_xpu started but
+            # before we write into device blocks, skip the scatter.
+            # Without this check we would write into blocks that have
+            # already been freed / reallocated to other requests.
+            if self._ctx.is_cancelled(request_id):
+                logger.warning(
+                    "_copy_memory_obj_to_chunk skipped: request %s "
+                    "was cancelled, aborting H2D scatter",
+                    request_id,
+                )
+                return
+
             bpc = entry.groups[gi].blocks_per_chunk
             chunk_start = chunk_idx * bpc
             chunk_end = chunk_start + bpc
@@ -1245,6 +1304,24 @@ class XpuTransferModule:
             src_flat = src_tensor.view(-1)
             # Host now stores padded layout — single bulk H2D copy.
             padded_bytes = nl * n_blocks * max_page
+            # If the source MemoryObj is smaller than expected, the store
+            # and retrieve computed different n_blocks (e.g. partial chunk
+            # stored, then full-range retrieve).  Rather than clamping
+            # (which silently loads partial KV → garbage output), fail the
+            # retrieve so the model recomputes from scratch.
+            src_avail = src_flat.numel()
+            if padded_bytes > src_avail:
+                logger.warning(
+                    "RETRIEVE_XPU n_blocks mismatch: padded_bytes=%d > "
+                    "src_avail=%d (gi=%d nl=%d n_blocks=%d max_page=%d) "
+                    "request=%s — failing retrieve to force recompute",
+                    padded_bytes, src_avail, gi, nl, n_blocks, max_page,
+                    request_id,
+                )
+                raise RuntimeError(
+                    f"n_blocks mismatch: store/retrieve divergence "
+                    f"(padded_bytes={padded_bytes} > src_avail={src_avail})"
+                )
             try:
                 staging_view.view(-1)[:padded_bytes].copy_(
                     src_flat[:padded_bytes]
@@ -1253,9 +1330,9 @@ class XpuTransferModule:
                 logger.error(
                     "H2D copy failed: gi=%d nl=%d n_blocks=%d "
                     "max_page=%d padded_bytes=%d "
-                    "staging_size=%d err=%s",
+                    "staging_size=%d src_avail=%d err=%s",
                     gi, nl, n_blocks, max_page, padded_bytes,
-                    staging_view.numel(), e,
+                    staging_view.numel(), src_avail, e,
                 )
                 raise
 

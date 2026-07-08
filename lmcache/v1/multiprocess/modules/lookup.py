@@ -504,9 +504,20 @@ class LookupModule:
     def end_session(self, request_id: str) -> None:
         """Remove the session for a finished request.
 
+        Also marks the request as cancelled so that in-flight XPU scatter
+        operations (running in the same server process) skip writing into
+        device blocks that may already be freed by the vLLM scheduler.
+
         Args:
             request_id: The request ID whose session should be removed.
         """
+        # Mark cancelled so XpuTransferModule skips scatter for this
+        # request.  This is a no-op for normal completions (the scatter
+        # has already finished) but critical for aborted requests where
+        # the vLLM scheduler may free blocks while the server-side
+        # H2D copy is still queued.
+        self._ctx.cancel_request(request_id)
+
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_VLLM_END_SESSION,
@@ -537,6 +548,11 @@ class LookupModule:
         #  and will be deleted after finish_read_prefetched, when we touch all keys,
         #  these keys has been deleted and will not be touched.
         self._ctx.storage_manager.touch_l1_keys(obj_keys)
+
+        # Cleanup: the cancelled flag was set at the top of end_session
+        # to prevent in-flight scatters.  Now that session cleanup is
+        # done, remove the flag so the set doesn't grow without bound.
+        self._ctx.clear_cancelled(request_id)
 
     # -----------------------------------------------------------------
     # Internal helpers

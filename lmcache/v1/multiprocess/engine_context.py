@@ -225,6 +225,35 @@ class MPCacheServerContext:
         self._session_manager = SessionManager(self._token_hasher)
         self._event_bus = get_event_bus()
         self._layout_desc_registry = LayoutDescRegistry()
+        # Set of request IDs cancelled by the client (abort path).
+        # Modules (e.g. XpuTransferModule) check this set before
+        # writing to device memory to avoid scatter into freed blocks.
+        self._cancelled_requests: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Cancel tracking
+    # ------------------------------------------------------------------
+
+    def cancel_request(self, request_id: str) -> None:
+        """Mark *request_id* as cancelled by the client (abort path).
+
+        Modules (e.g. ``XpuTransferModule``) check :meth:`is_cancelled`
+        before writing to device memory so that in-flight scatter
+        operations do not corrupt freed / reallocated blocks.
+        """
+        self._cancelled_requests.add(request_id)
+
+    def is_cancelled(self, request_id: str) -> bool:
+        """Return ``True`` if *request_id* was previously cancelled."""
+        return request_id in self._cancelled_requests
+
+    def clear_cancelled(self, request_id: str) -> None:
+        """Remove *request_id* from the cancelled set once cleanup is done."""
+        self._cancelled_requests.discard(request_id)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     def close(self) -> None:
         """
