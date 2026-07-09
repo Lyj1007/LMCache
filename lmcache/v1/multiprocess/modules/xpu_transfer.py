@@ -52,6 +52,82 @@ import lmcache.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 
+def _copy_split_on_host_boundary(
+    host_slice: torch.Tensor,
+    dev_slice: torch.Tensor,
+    host_ptr: int,
+    nbytes: int,
+    segments: list[tuple[int, int]],
+) -> None:
+    """D2H/H2D copy split at XPU pinned sub-segment boundaries.
+
+    Called as fallback when a full-range ``.copy_()`` fails because the
+    host range straddles two adjacent ``cudaHostRegister`` sub-segments
+    (the XPU driver rejects this with ``error code=1 invalid argument``).
+
+    The segment size is looked up via ``find_pinned_pool_covering`` from
+    ``xpu_cuda_compat.mem_alloc`` (single source of truth).  If the pool
+    is not tracked there, ``segments`` (caller-supplied SHM pool list)
+    is used as fallback with the same segment size.
+
+    Args:
+        host_slice: 1-D host tensor, length == ``nbytes``.
+        dev_slice: 1-D device tensor, length == ``nbytes``.
+        host_ptr: raw start address of ``host_slice``.
+        nbytes: number of bytes to copy.
+        segments: caller-supplied ``(base, size)`` fallback pools.
+    """
+    # First Party
+    from lmcache.xpu_cuda_compat.mem_alloc import (
+        _PIN_SEGMENT_BYTES,
+        find_pinned_pool_covering,
+    )
+
+    pool_base = -1
+    seg_bytes = _PIN_SEGMENT_BYTES
+    hit = find_pinned_pool_covering(host_ptr, nbytes)
+    if hit is not None:
+        pool_base, _, seg_bytes = hit
+    else:
+        for base, size in segments:
+            if base <= host_ptr and host_ptr + nbytes <= base + size:
+                pool_base = base
+                break
+
+    if pool_base < 0:
+        logger.warning(
+            "XPU boundary split: host_ptr=0x%x nbytes=%d not tracked, "
+            "falling back to unsplit copy_",
+            host_ptr, nbytes,
+        )
+        host_slice.copy_(dev_slice, non_blocking=True)
+        return
+
+    offset_in_pool = host_ptr - pool_base
+    end_offset = offset_in_pool + nbytes - 1
+
+    # Fast path: entire range in one sub-segment.
+    if (offset_in_pool // seg_bytes) == (end_offset // seg_bytes):
+        host_slice.copy_(dev_slice, non_blocking=True)
+        return
+
+    # Slow path: split at each crossed boundary.
+    logger.debug(
+        "XPU boundary split: pool_base=0x%x host_ptr=0x%x nbytes=%d "
+        "offset=%d seg_bytes=%d",
+        pool_base, host_ptr, nbytes, offset_in_pool, seg_bytes,
+    )
+    offset = 0
+    while offset < nbytes:
+        cur = offset_in_pool + offset
+        boundary = ((cur // seg_bytes) + 1) * seg_bytes
+        piece = min(nbytes - offset, boundary - cur)
+        host_slice[offset:offset + piece].copy_(
+            dev_slice[offset:offset + piece], non_blocking=True
+        )
+        offset += piece
+
+
 # Map torch dtype name -> __cuda_array_interface__ typestr. bfloat16/fp8
 # have no native NumPy equivalent, so they ride along as int16/uint8 and
 # get re-viewed once the wrapper is converted to a torch tensor.
@@ -1120,17 +1196,18 @@ class XpuTransferModule:
                             gi, chunk_idx, _d2h_elapsed,
                         )
                 except RuntimeError as e:
-                    logger.error(
-                        "D2H copy failed: gi=%d nl=%d n_blocks=%d max_page=%d "
-                        "padded_bytes=%d dst_size=%d staging_size=%d "
-                        "dst_ptr=0x%x staging_ptr=0x%x err=%s",
-                        gi, nl, n_blocks, max_page, padded_bytes,
-                        dst_flat.numel(), staging_view.numel(),
-                        dst_flat.data_ptr(),
-                        staging_view.data_ptr(),
-                        e,
+                    logger.warning(
+                        "D2H full copy failed, retrying with boundary "
+                        "split: gi=%d dst_ptr=0x%x padded_bytes=%d err=%s",
+                        gi, dst_flat.data_ptr(), padded_bytes, e,
                     )
-                    raise
+                    _copy_split_on_host_boundary(
+                        dst_flat[:padded_bytes],
+                        staging_view.view(-1)[:padded_bytes],
+                        dst_flat.data_ptr(),
+                        padded_bytes,
+                        segments=self._registered_shm_segments,
+                    )
 
     @_lmcache_nvtx_annotate
     def retrieve_xpu(
@@ -1342,14 +1419,18 @@ class XpuTransferModule:
                     src_flat[:padded_bytes], non_blocking=True
                 )
             except RuntimeError as e:
-                logger.error(
-                    "H2D copy failed: gi=%d nl=%d n_blocks=%d "
-                    "max_page=%d padded_bytes=%d "
-                    "staging_size=%d src_avail=%d err=%s",
-                    gi, nl, n_blocks, max_page, padded_bytes,
-                    staging_view.numel(), src_avail, e,
+                logger.warning(
+                    "H2D full copy failed, retrying with boundary "
+                    "split: gi=%d src_ptr=0x%x padded_bytes=%d err=%s",
+                    gi, src_flat.data_ptr(), padded_bytes, e,
                 )
-                raise
+                _copy_split_on_host_boundary(
+                    staging_view.view(-1)[:padded_bytes],
+                    src_flat[:padded_bytes],
+                    src_flat.data_ptr(),
+                    padded_bytes,
+                    segments=self._registered_shm_segments,
+                )
 
             skip_n = 0
             if chunk_idx == 0 and gi < len(skip_blocks_per_group):

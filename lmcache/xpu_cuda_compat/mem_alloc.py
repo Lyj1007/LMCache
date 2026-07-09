@@ -76,10 +76,12 @@ _allocation_sizes: dict[int, int] = {}
 # Maximum bytes per single ``xpu_host_register`` / ``cudaHostRegister`` call.
 # The Kunlun XPU driver asserts ``SglSize <= 0xffffffffULL`` in
 # ``memdescCreate`` (mem_desc.c:282); registering 1024 GiB in a single call
-# overflows an internal 32-bit field, while 512 GiB is known to work.  128 GiB
-# segments give a 4× safety margin below the verified 512 GiB ceiling and
-# keep the number of ioctl round-trips small (8 segments for 1 TiB).
-_PIN_SEGMENT_BYTES: int = 128 * 1024 * 1024 * 1024
+# overflows an internal 32-bit field, while 512 GiB is verified to work.
+# Using 512 GiB directly eliminates internal sub-segment boundaries for
+# pools ≤ 512 GiB, so a single ``.copy_()`` never straddles two registered
+# regions.  For pools > 512 GiB, ``_copy_split_on_host_boundary`` in
+# ``xpu_transfer`` splits the copy at each 512 GiB boundary as a fallback.
+_PIN_SEGMENT_BYTES: int = 512 * 1024 * 1024 * 1024
 
 # Tracks registered segments per base pointer so ``_unpin_host_memory`` can
 # unregister each segment individually.  Key is the original base pointer
@@ -164,7 +166,7 @@ def _unpin_single(ptr: int) -> None:
 def _pin_host_memory(ptr: int, size: int) -> None:
     """Register a host allocation for XPU or CUDA DMA.
 
-    Buffers larger than ``_PIN_SEGMENT_BYTES`` are registered in 128 GiB
+    Buffers larger than ``_PIN_SEGMENT_BYTES`` are registered in 512 GiB
     segments to avoid the Kunlun XPU driver's 32-bit SGL size overflow
     (``SglSize <= 0xffffffffULL`` assertion in ``memdescCreate``).  Each
     segment is tracked in ``_pinned_segments`` so the corresponding
@@ -525,6 +527,36 @@ def host_unregister(ptr: int) -> None:
         RuntimeError: If the host unregister API reports an error.
     """
     _unpin_host_memory(ptr)
+
+
+def find_pinned_pool_covering(
+    ptr: int, nbytes: int
+) -> Optional[tuple[int, int, int]]:
+    """Return ``(pool_base, pool_size, segment_bytes)`` for the registered
+    pin pool that fully covers ``[ptr, ptr + nbytes)``, or ``None``.
+
+    Each pool is internally registered in ``_PIN_SEGMENT_BYTES`` (512 GiB)
+    sub-segments starting at ``pool_base``; callers should split any
+    ``.copy_()`` at those sub-segment boundaries so the Kunlun XPU driver
+    does not reject the copy with ``error code=1 invalid argument`` when
+    the host range straddles two adjacent sub-segments.
+
+    Args:
+        ptr: Absolute host address of the copy's start.
+        nbytes: Number of bytes to be copied.
+
+    Returns:
+        ``(pool_base, pool_size, segment_bytes)`` on success, else
+        ``None`` if the range is not contained in any tracked pool.
+    """
+    if nbytes <= 0:
+        return None
+    end = ptr + nbytes
+    for base, seg_list in _pinned_segments.items():
+        pool_size = sum(sz for _, sz in seg_list)
+        if base <= ptr and end <= base + pool_size:
+            return base, pool_size, _PIN_SEGMENT_BYTES
+    return None
 
 
 def has_xpu_runtime() -> bool:
