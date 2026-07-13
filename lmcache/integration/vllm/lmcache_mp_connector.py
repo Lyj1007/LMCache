@@ -382,6 +382,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # memory.
         self._use_interprocess_events = not is_kunlun_xpu()
 
+        # When True, retrieves are handled synchronously in start_load_kv
+        # instead of the default async WAITING_FOR_REMOTE_KVS path. Suitable for
+        # P-only / low-concurrency scenarios where there is no decode work to
+        # overlap with the retrieve.
+        self._sync_load = vllm_config.kv_transfer_config.get_from_extra_config(
+            "sync_load", False
+        )
+        if self._sync_load:
+            logger.info(
+                "sync_load enabled: retrieves will block in start_load_kv "
+                "instead of using WAITING_FOR_REMOTE_KVS"
+            )
+
         # Tokens covered by one paged chunk (one block ID) of each engine
         # group, from the group's KV cache spec. Hybrid models can mix
         # different values (e.g. gemma-4: sliding-window groups 32,
@@ -593,6 +606,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # the retrieve+broadcast synchronous within start_load_kv.
             self._broadcaster.drain_pending(self.worker_adapter._mq_timeout)
 
+        # sync_load: block until all retrieves complete BEFORE the forward
+        # pass starts.  This must happen here (in start_load_kv, before any
+        # model layer / collective op) rather than in wait_for_layer_load,
+        # because blocking inside the forward pass would desynchronize DP
+        # ranks at the next all_reduce and deadlock the group.
+        if self._sync_load:
+            for request_id, (r_future, _) in list(
+                self.worker_adapter.retrieve_futures.items()
+            ):
+                r_future.result()
+
     def _enqueue_mla_broadcasts(
         self, request_ids: list[str], ops: list["LoadStoreOp"]
     ) -> None:
@@ -624,7 +648,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         paged buffer. This is called from within attention layer to ensure
         async copying from start_load_kv is complete.
 
-        This interface will be useful for layer-by-layer pipelining.
+        In sync_load mode, the retrieve wait is handled in start_load_kv
+        (before the forward pass) to avoid desynchronizing DP ranks. This
+        method is a no-op in sync_load mode.
 
         Args:
             layer_name: the name of that layer
@@ -736,6 +762,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             call to this method (this call or a prior one).
         """
         val = self.worker_adapter.get_finished(finished_req_ids)
+        if self._sync_load:
+            # In sync_load mode, retrieves are awaited synchronously in
+            # start_load_kv and the request never enters
+            # WAITING_FOR_REMOTE_KVS (get_num_new_matched_tokens always
+            # reports load_async=False). Reporting the request_id here as
+            # finished_recving would hit
+            # scheduler._update_from_kv_xfer_finished's
+            # `assert RequestStatus.is_finished(req.status)` branch, since
+            # the request's status is RUNNING, not WAITING_FOR_REMOTE_KVS
+            # or finished -> AssertionError / engine crash. Drop the
+            # recving half entirely; only forward the sending/saving ids.
+            return val[0], None
+
         # PR5b: peer ranks that skip retrieve have no retrieve_futures.
         # We must report pending retrieve request_ids as finished after
         # broadcast drain completes, so vLLM unblocks deferred requests.
@@ -861,6 +900,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         logger.debug(
             "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
         )
+        # In sync_load mode, return load_async=False so the scheduler
+        # schedules the request immediately (RUNNING) instead of entering
+        # WAITING_FOR_REMOTE_KVS. The actual retrieve wait happens in
+        # start_load_kv before the forward pass.
+        if self._sync_load:
+            return need_to_load, False
         return need_to_load, need_to_load > 0
 
     def update_state_after_alloc(

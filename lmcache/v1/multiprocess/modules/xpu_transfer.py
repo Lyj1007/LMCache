@@ -1296,6 +1296,15 @@ class XpuTransferModule:
                             skip_blocks_per_group,
                             key.request_id,
                         )
+                    # Single sync after all chunks: the GPU stream has
+                    # executed all H2D + scatter ops in order. This replaces
+                    # the per-chunk event.synchronize() that left GPU idle
+                    # between chunks while the Python thread woke up.
+                    sync_event = torch_dev.Event()
+                    sync_event.record(
+                        torch_dev.current_stream(entry.device)
+                    )
+                    sync_event.synchronize()
                 # If the request was cancelled mid-scatter (e.g.
                 # end_session arrived from the scheduler), some groups
                 # may have been skipped by _copy_memory_obj_to_chunk.
@@ -1445,10 +1454,8 @@ class XpuTransferModule:
                 skip_prefix_n_blocks=skip_n,
                 paged_buffer_ptrs_dev=entry.paged_buffer_ptrs_devs[gi],
             )
-        # Use stream event instead of full device synchronize to only wait
-        # for the scatter (H2D) operations, not all device activity.
-        event = torch_dev.Event()
-        event.record(torch_dev.current_stream(entry.device))
-        event.synchronize()
+        # No per-chunk sync: all H2D + scatter ops are on the same stream
+        # and execute in order. A single sync at the end of retrieve_xpu
+        # ensures completion before the ZMQ response is sent.
 
 _ = (lmc_ops, lmcache_memcpy_async_d2h, lmcache_memcpy_async_h2d)
