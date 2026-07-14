@@ -19,6 +19,7 @@ end-to-end design rationale. The server side here:
 """
 
 # Standard
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 import threading
@@ -48,6 +49,26 @@ from lmcache.v1.multiprocess.engine_module import HandlerSpec, ThreadPoolType
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.multiprocess.protocols.engine import RegisterXpuContextResponse
 import lmcache.c_ops as lmc_ops
+
+# ---------------------------------------------------------------------------
+# Async DMA control per direction.
+#
+# LMCACHE_XPU_STORE_SYNC_DMA: store (D2H) path.  Default "1" (synchronous,
+# non_blocking=False) — workaround for XPU hardware bug where cross-process
+# async D2H DMA on the same physical GPU can cause the worker's multi-
+# stream attention kernel to hang (XPUW err task).  Set to "0" to enable
+# async store DMA for maximum throughput.
+#
+# LMCACHE_XPU_RETRIEVE_SYNC_DMA: retrieve (H2D) path.  Default "0" (async,
+# non_blocking=True) — the H2D direction has not been observed to trigger
+# the hang.  Set to "1" to force synchronous retrieve DMA.
+# ---------------------------------------------------------------------------
+_XPU_STORE_DMA_NON_BLOCKING: bool = (
+    os.environ.get("LMCACHE_XPU_STORE_SYNC_DMA", "1") != "1"
+)
+_XPU_RETRIEVE_DMA_NON_BLOCKING: bool = (
+    os.environ.get("LMCACHE_XPU_RETRIEVE_SYNC_DMA", "0") != "1"
+)
 
 logger = init_logger(__name__)
 
@@ -100,7 +121,7 @@ def _copy_split_on_host_boundary(
             "falling back to unsplit copy_",
             host_ptr, nbytes,
         )
-        host_slice.copy_(dev_slice, non_blocking=True)
+        host_slice.copy_(dev_slice, non_blocking=_XPU_STORE_DMA_NON_BLOCKING)
         return
 
     offset_in_pool = host_ptr - pool_base
@@ -108,7 +129,7 @@ def _copy_split_on_host_boundary(
 
     # Fast path: entire range in one sub-segment.
     if (offset_in_pool // seg_bytes) == (end_offset // seg_bytes):
-        host_slice.copy_(dev_slice, non_blocking=True)
+        host_slice.copy_(dev_slice, non_blocking=_XPU_STORE_DMA_NON_BLOCKING)
         return
 
     # Slow path: split at each crossed boundary.
@@ -123,7 +144,7 @@ def _copy_split_on_host_boundary(
         boundary = ((cur // seg_bytes) + 1) * seg_bytes
         piece = min(nbytes - offset, boundary - cur)
         host_slice[offset:offset + piece].copy_(
-            dev_slice[offset:offset + piece], non_blocking=True
+            dev_slice[offset:offset + piece], non_blocking=_XPU_STORE_DMA_NON_BLOCKING
         )
         offset += piece
 
@@ -395,6 +416,14 @@ class XpuTransferModule:
         self._shm_pool_info: ShmPoolInfo = self._ctx.shm_pool_info
         self._shm_registered = False
         self._lock = threading.Lock()
+        logger.info(
+            "XpuTransferModule: store DMA = %s (LMCACHE_XPU_STORE_SYNC_DMA=%s), "
+            "retrieve DMA = %s (LMCACHE_XPU_RETRIEVE_SYNC_DMA=%s)",
+            "async" if _XPU_STORE_DMA_NON_BLOCKING else "sync",
+            os.environ.get("LMCACHE_XPU_STORE_SYNC_DMA", "1"),
+            "async" if _XPU_RETRIEVE_DMA_NON_BLOCKING else "sync",
+            os.environ.get("LMCACHE_XPU_RETRIEVE_SYNC_DMA", "0"),
+        )
 
     @property
     def context(self) -> MPCacheEngineContext:
@@ -1060,7 +1089,7 @@ class XpuTransferModule:
                             len(block_ids[gi]), dtype=torch.int64,
                             device=entry.device,
                         )
-                        dev_t.copy_(cpu_pinned, non_blocking=True)
+                        dev_t.copy_(cpu_pinned, non_blocking=_XPU_STORE_DMA_NON_BLOCKING)
                         block_ids_dev_per_group.append(dev_t)
                     for chunk_idx, obj_key in enumerate(obj_keys):
                         memory_obj = reserved_dict.get(obj_key)
@@ -1197,7 +1226,7 @@ class XpuTransferModule:
                 padded_bytes = nl * n_blocks * max_page
                 try:
                     _d2h_st = time.perf_counter()
-                    dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes], non_blocking=True)
+                    dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes], non_blocking=_XPU_STORE_DMA_NON_BLOCKING)
                     _d2h_elapsed = time.perf_counter() - _d2h_st
                     if _d2h_elapsed > 1.0:
                         logger.warning(
@@ -1312,7 +1341,7 @@ class XpuTransferModule:
                             len(block_ids[gi]), dtype=torch.int64,
                             device=entry.device,
                         )
-                        dev_t.copy_(cpu_pinned, non_blocking=True)
+                        dev_t.copy_(cpu_pinned, non_blocking=_XPU_RETRIEVE_DMA_NON_BLOCKING)
                         block_ids_dev_per_group.append(dev_t)
                     for chunk_idx, memory_obj in enumerate(memory_objs):
                         total_bytes += memory_obj.get_size()
@@ -1456,7 +1485,7 @@ class XpuTransferModule:
                 )
             try:
                 staging_view.view(-1)[:padded_bytes].copy_(
-                    src_flat[:padded_bytes], non_blocking=True
+                    src_flat[:padded_bytes], non_blocking=_XPU_RETRIEVE_DMA_NON_BLOCKING
                 )
             except RuntimeError as e:
                 logger.warning(
