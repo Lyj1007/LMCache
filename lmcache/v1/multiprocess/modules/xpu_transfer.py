@@ -1044,11 +1044,18 @@ class XpuTransferModule:
                 with torch_dev.device(entry.device):
                     # Pre-upload all block_ids to device once via pinned
                     # memory so the H2D copy is async (non_blocking=True).
+                    # Keep pinned sources alive until after event.synchronize()
+                    # below — without this, the per-iteration cpu_pinned
+                    # reference is dropped before the async DMA completes,
+                    # risking use-after-free if the XPU host allocator
+                    # reuses the slot.
                     block_ids_dev_per_group = []
+                    _pinned_keepalive: list[torch.Tensor] = []
                     for gi in range(num_groups):
                         cpu_pinned = torch.tensor(
                             block_ids[gi], dtype=torch.int64, pin_memory=True
                         )
+                        _pinned_keepalive.append(cpu_pinned)
                         dev_t = torch.empty(
                             len(block_ids[gi]), dtype=torch.int64,
                             device=entry.device,
@@ -1158,7 +1165,10 @@ class XpuTransferModule:
             nl = len(entry.group_layer_tensors_int8[gi])
             max_page = entry.max_page_size_per_group[gi]
             page_sizes = entry.layer_page_sizes_per_group[gi]
-            n_blocks = chunk_end - chunk_start
+            # Use actual slice length, not chunk_end - chunk_start, so a
+            # partial last chunk is handled correctly instead of over-
+            # reading the device tensor.
+            n_blocks = block_ids_dev.numel()
             staging_view = entry.store_staging_buffer[:nl * n_blocks * max_page].view(
                 nl, n_blocks, max_page
             )
@@ -1244,6 +1254,21 @@ class XpuTransferModule:
         if not obj_keys:
             return True
 
+        # Block-id underflow guard — symmetric with store_xpu.  Without
+        # this, a short block_ids list would silently over-read the
+        # device tensor in _copy_memory_obj_to_chunk.
+        num_groups = len(entry.groups)
+        blocks_per_chunk_per_group = [g.blocks_per_chunk for g in entry.groups]
+        if len(block_ids) < num_groups or any(
+            len(block_ids[gi]) < len(obj_keys) * blocks_per_chunk_per_group[gi]
+            for gi in range(num_groups)
+        ):
+            logger.warning(
+                "RETRIEVE_XPU block ID underflow request_id=%s; skipping retrieve",
+                key.request_id,
+            )
+            return False
+
         retrieve_succeeded = False
         prefetched_keys: list[ObjectKey] = []
         total_bytes: int = 0
@@ -1274,12 +1299,15 @@ class XpuTransferModule:
                 with torch_dev.device(entry.device):
                     # Pre-upload all block_ids to device once via pinned
                     # memory so the H2D copy is async (non_blocking=True).
-                    num_groups = len(entry.groups)
+                    # Keep pinned sources alive until after sync_event below
+                    # — see store_xpu for the use-after-free rationale.
                     block_ids_dev_per_group = []
+                    _pinned_keepalive: list[torch.Tensor] = []
                     for gi in range(num_groups):
                         cpu_pinned = torch.tensor(
                             block_ids[gi], dtype=torch.int64, pin_memory=True
                         )
+                        _pinned_keepalive.append(cpu_pinned)
                         dev_t = torch.empty(
                             len(block_ids[gi]), dtype=torch.int64,
                             device=entry.device,
@@ -1393,7 +1421,10 @@ class XpuTransferModule:
             nl = len(entry.group_layer_tensors_int8[gi])
             max_page = entry.max_page_size_per_group[gi]
             page_sizes = entry.layer_page_sizes_per_group[gi]
-            n_blocks = chunk_end - chunk_start
+            # Use actual slice length, not chunk_end - chunk_start, so a
+            # partial last chunk is handled correctly instead of over-
+            # reading the device tensor.
+            n_blocks = block_ids_dev.numel()
 
             # Copy host MemoryObj per-group tensor → staging buffer (H2D)
             src_tensor = memory_obj.get_tensor(gi)
