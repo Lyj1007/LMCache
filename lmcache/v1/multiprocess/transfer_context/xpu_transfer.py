@@ -32,8 +32,10 @@ The implementation follows the threading model in §3.1 and §8.1:
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
+import os
 import queue
 import threading
+import time
 
 # Third Party
 import torch
@@ -94,6 +96,11 @@ _SUBMIT_QUEUE_SHUTDOWN_PUT_SECONDS: float = 5.0
 # responsive to ``_closed`` even when ``put`` of the shutdown sentinel
 # raced with a full queue.
 _BG_LOOP_POLL_SECONDS: float = 1.0
+
+# Emit diagnostic logs only for unusually slow XPU wait stages.
+_XPU_SLOW_WAIT_SECONDS: float = float(
+    os.environ.get("LMCACHE_XPU_SLOW_WAIT_SEC", "3.0")
+)
 
 
 @dataclass
@@ -720,20 +727,38 @@ class XPUDevicePtrTransferContext(TransferContext):
             if self._closed.is_set():
                 req.future.set_result(False)
                 continue
+            request_id = getattr(req.key, "request_id", "<unknown>")
+            sync_st = time.perf_counter()
             try:
                 req.event.synchronize()
             except Exception:
                 logger.exception(
-                    "XPU BG: event.synchronize() failed for request_type=%s; "
-                    "marking future failed",
+                    "XPU BG: event.synchronize() failed for request_type=%s "
+                    "request_id=%s; marking future failed",
                     req.request_type.name,
+                    request_id,
                 )
                 req.future.set_result(False)
                 continue
+            sync_elapsed = time.perf_counter() - sync_st
+            if sync_elapsed >= _XPU_SLOW_WAIT_SECONDS:
+                logger.warning(
+                    "XPU BG: slow event.synchronize request_type=%s "
+                    "request_id=%s instance_id=%d elapsed=%.3f s "
+                    "threshold=%.3f s retrieve_queue=%d store_queue=%d",
+                    req.request_type.name,
+                    request_id,
+                    req.instance_id,
+                    sync_elapsed,
+                    _XPU_SLOW_WAIT_SECONDS,
+                    self._retrieve_queue.qsize(),
+                    self._store_queue.qsize(),
+                )
 
             assert self._mq_client is not None
             assert self._send_request is not None
 
+            mq_ack_st: float | None = None
             try:
                 if req.request_type == RequestType.STORE_XPU:
                     payloads: list[Any] = [
@@ -753,26 +778,59 @@ class XPUDevicePtrTransferContext(TransferContext):
                         f"XPU BG: unsupported request type {req.request_type}"
                     )
 
+                mq_send_st = time.perf_counter()
                 mq_future = self._send_request(
                     self._mq_client,
                     req.request_type,
                     payloads,
                 )
+                mq_send_elapsed = time.perf_counter() - mq_send_st
+                if mq_send_elapsed >= _XPU_SLOW_WAIT_SECONDS:
+                    logger.warning(
+                        "XPU BG: slow MQ send request_type=%s request_id=%s "
+                        "instance_id=%d elapsed=%.3f s threshold=%.3f s",
+                        req.request_type.name,
+                        request_id,
+                        req.instance_id,
+                        mq_send_elapsed,
+                        _XPU_SLOW_WAIT_SECONDS,
+                    )
+
+                mq_ack_st = time.perf_counter()
                 ok = mq_future.result(timeout=self._mq_timeout)
+                mq_ack_elapsed = time.perf_counter() - mq_ack_st
+                if mq_ack_elapsed >= _XPU_SLOW_WAIT_SECONDS:
+                    logger.warning(
+                        "XPU BG: slow MQ ack request_type=%s request_id=%s "
+                        "instance_id=%d elapsed=%.3f s threshold=%.3f s ok=%s",
+                        req.request_type.name,
+                        request_id,
+                        req.instance_id,
+                        mq_ack_elapsed,
+                        _XPU_SLOW_WAIT_SECONDS,
+                        ok,
+                    )
                 req.future.set_result(bool(ok))
             except TimeoutError:
+                mq_ack_elapsed = (
+                    time.perf_counter() - mq_ack_st
+                    if mq_ack_st is not None
+                    else self._mq_timeout
+                )
                 logger.warning(
-                    "XPU BG: %s request_id=%s timed out after %.1fs",
+                    "XPU BG: %s request_id=%s timed out after %.1fs "
+                    "(ack_wait_elapsed=%.3f s)",
                     req.request_type.name,
-                    getattr(req.key, "request_id", "<unknown>"),
+                    request_id,
                     self._mq_timeout,
+                    mq_ack_elapsed,
                 )
                 req.future.set_result(False)
             except Exception:
                 logger.exception(
                     "XPU BG: %s request_id=%s failed",
                     req.request_type.name,
-                    getattr(req.key, "request_id", "<unknown>"),
+                    request_id,
                 )
                 req.future.set_result(False)
 

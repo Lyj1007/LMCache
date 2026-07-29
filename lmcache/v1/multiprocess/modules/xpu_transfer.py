@@ -70,6 +70,11 @@ _XPU_RETRIEVE_DMA_NON_BLOCKING: bool = (
     os.environ.get("LMCACHE_XPU_RETRIEVE_SYNC_DMA", "0") != "1"
 )
 
+# Emit diagnostic logs only for unusually slow XPU wait/copy stages.
+_XPU_SLOW_WAIT_SECONDS: float = float(
+    os.environ.get("LMCACHE_XPU_SLOW_WAIT_SEC", "3.0")
+)
+
 logger = init_logger(__name__)
 
 
@@ -1027,7 +1032,18 @@ class XpuTransferModule:
             )
             return False
 
+        resolve_st = time.perf_counter()
         obj_keys = self._ctx.resolve_obj_keys(key)
+        resolve_elapsed = time.perf_counter() - resolve_st
+        if resolve_elapsed >= _XPU_SLOW_WAIT_SECONDS:
+            logger.warning(
+                "STORE_XPU slow resolve_obj_keys request_id=%s "
+                "instance_id=%d elapsed=%.3f s threshold=%.3f s",
+                key.request_id,
+                instance_id,
+                resolve_elapsed,
+                _XPU_SLOW_WAIT_SECONDS,
+            )
         if not obj_keys:
             return True
 
@@ -1048,7 +1064,18 @@ class XpuTransferModule:
         reserved_dict: dict[ObjectKey, MemoryObj] = {}
         store_succeeded = False
         try:
+            lock_st = time.perf_counter()
             with entry.store_lock:
+                lock_elapsed = time.perf_counter() - lock_st
+                if lock_elapsed >= _XPU_SLOW_WAIT_SECONDS:
+                    logger.warning(
+                        "STORE_XPU slow store_lock wait request_id=%s "
+                        "instance_id=%d elapsed=%.3f s threshold=%.3f s",
+                        key.request_id,
+                        instance_id,
+                        lock_elapsed,
+                        _XPU_SLOW_WAIT_SECONDS,
+                    )
                 if entry.invalidated:
                     logger.warning(
                         "STORE_XPU skipped: XPU instance %d was "
@@ -1059,9 +1086,22 @@ class XpuTransferModule:
                 layout_desc = _layout_desc_from_groups(
                     entry.groups, entry.layer_handles
                 )
+                reserve_st = time.perf_counter()
                 reserved_dict = self._ctx.storage_manager.reserve_write(
                     obj_keys, layout_desc, "new"
                 )
+                reserve_elapsed = time.perf_counter() - reserve_st
+                if reserve_elapsed >= _XPU_SLOW_WAIT_SECONDS:
+                    logger.warning(
+                        "STORE_XPU slow reserve_write request_id=%s "
+                        "instance_id=%d chunks=%d elapsed=%.3f s "
+                        "threshold=%.3f s",
+                        key.request_id,
+                        instance_id,
+                        len(obj_keys),
+                        reserve_elapsed,
+                        _XPU_SLOW_WAIT_SECONDS,
+                    )
 
                 # Device guard: the server process serves multiple DP workers
                 # concurrently on different XPU devices.  The custom gather
@@ -1078,6 +1118,7 @@ class XpuTransferModule:
                     # reference is dropped before the async DMA completes,
                     # risking use-after-free if the XPU host allocator
                     # reuses the slot.
+                    block_ids_upload_st = time.perf_counter()
                     block_ids_dev_per_group = []
                     _pinned_keepalive: list[torch.Tensor] = []
                     for gi in range(num_groups):
@@ -1089,22 +1130,47 @@ class XpuTransferModule:
                             len(block_ids[gi]), dtype=torch.int64,
                             device=entry.device,
                         )
-                        dev_t.copy_(cpu_pinned, non_blocking=_XPU_STORE_DMA_NON_BLOCKING)
+                        dev_t.copy_(
+                            cpu_pinned, non_blocking=_XPU_STORE_DMA_NON_BLOCKING
+                        )
                         block_ids_dev_per_group.append(dev_t)
+                    block_ids_upload_elapsed = (
+                        time.perf_counter() - block_ids_upload_st
+                    )
+                    if block_ids_upload_elapsed >= _XPU_SLOW_WAIT_SECONDS:
+                        logger.warning(
+                            "STORE_XPU slow block_ids upload request_id=%s "
+                            "instance_id=%d groups=%d elapsed=%.3f s "
+                            "threshold=%.3f s",
+                            key.request_id,
+                            instance_id,
+                            num_groups,
+                            block_ids_upload_elapsed,
+                            _XPU_SLOW_WAIT_SECONDS,
+                        )
                     for chunk_idx, obj_key in enumerate(obj_keys):
                         memory_obj = reserved_dict.get(obj_key)
                         if memory_obj is None:
                             continue
                         _copy_st = time.perf_counter()
                         self._copy_chunk_to_memory_obj(
-                            entry, chunk_idx, block_ids_dev_per_group, memory_obj
+                            entry,
+                            chunk_idx,
+                            block_ids_dev_per_group,
+                            memory_obj,
+                            key.request_id,
                         )
                         _copy_elapsed = time.perf_counter() - _copy_st
-                        if _copy_elapsed > 1.0:
+                        if _copy_elapsed >= _XPU_SLOW_WAIT_SECONDS:
                             logger.warning(
                                 "STORE_XPU slow copy chunk_idx=%d "
-                                "request_id=%s elapsed=%.3f s",
-                                chunk_idx, key.request_id, _copy_elapsed,
+                                "request_id=%s instance_id=%d elapsed=%.3f s "
+                                "threshold=%.3f s",
+                                chunk_idx,
+                                key.request_id,
+                                instance_id,
+                                _copy_elapsed,
+                                _XPU_SLOW_WAIT_SECONDS,
                             )
                     # Sync after D2H copies to ensure data integrity.
                     event = torch_dev.Event()
@@ -1112,11 +1178,14 @@ class XpuTransferModule:
                     _sync_st = time.perf_counter()
                     event.synchronize()
                     _sync_elapsed = time.perf_counter() - _sync_st
-                    if _sync_elapsed > 1.0:
+                    if _sync_elapsed >= _XPU_SLOW_WAIT_SECONDS:
                         logger.warning(
                             "STORE_XPU slow D2H sync request_id=%s "
-                            "elapsed=%.3f s",
-                            key.request_id, _sync_elapsed,
+                            "instance_id=%d elapsed=%.3f s threshold=%.3f s",
+                            key.request_id,
+                            instance_id,
+                            _sync_elapsed,
+                            _XPU_SLOW_WAIT_SECONDS,
                         )
                 # Re-check invalidated after copy loop: if the entry was
                 # invalidated mid-copy, some chunks may have been skipped
@@ -1137,7 +1206,20 @@ class XpuTransferModule:
         finally:
             stored_count = len(reserved_dict) if store_succeeded else 0
             if stored_count:
+                finish_st = time.perf_counter()
                 self._ctx.storage_manager.finish_write(list(reserved_dict.keys()))
+                finish_elapsed = time.perf_counter() - finish_st
+                if finish_elapsed >= _XPU_SLOW_WAIT_SECONDS:
+                    logger.warning(
+                        "STORE_XPU slow finish_write request_id=%s "
+                        "instance_id=%d chunks=%d elapsed=%.3f s "
+                        "threshold=%.3f s",
+                        key.request_id,
+                        instance_id,
+                        stored_count,
+                        finish_elapsed,
+                        _XPU_SLOW_WAIT_SECONDS,
+                    )
 
         ed = time.perf_counter()
         if reserved_dict:
@@ -1167,6 +1249,7 @@ class XpuTransferModule:
         chunk_idx: int,
         block_ids_dev_per_group: list[torch.Tensor],
         memory_obj: MemoryObj,
+        request_id: str,
     ) -> None:
         """D2H copy one chunk's KV data from peer device pointers into SHM.
 
@@ -1176,6 +1259,7 @@ class XpuTransferModule:
             block_ids_dev_per_group: Per-group block ids pre-uploaded to
                 device (full request).
             memory_obj: Destination L1 SHM-backed memory slot.
+            request_id: Request id used to correlate slow-stage diagnostics.
         """
         if _gather_op is None or entry.store_staging_buffer is None:
             return
@@ -1212,11 +1296,15 @@ class XpuTransferModule:
                 paged_buffer_ptrs_dev=entry.paged_buffer_ptrs_devs[gi],
             )
             _gather_elapsed = time.perf_counter() - _gather_st
-            if _gather_elapsed > 1.0:
+            if _gather_elapsed >= _XPU_SLOW_WAIT_SECONDS:
                 logger.warning(
                     "STORE_XPU slow gather gi=%d chunk_idx=%d "
-                    "elapsed=%.3f s",
-                    gi, chunk_idx, _gather_elapsed,
+                    "request_id=%s elapsed=%.3f s threshold=%.3f s",
+                    gi,
+                    chunk_idx,
+                    request_id,
+                    _gather_elapsed,
+                    _XPU_SLOW_WAIT_SECONDS,
                 )
 
             # Copy staging → host MemoryObj per-group tensor (padded layout)
@@ -1228,11 +1316,15 @@ class XpuTransferModule:
                     _d2h_st = time.perf_counter()
                     dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes], non_blocking=_XPU_STORE_DMA_NON_BLOCKING)
                     _d2h_elapsed = time.perf_counter() - _d2h_st
-                    if _d2h_elapsed > 1.0:
+                    if _d2h_elapsed >= _XPU_SLOW_WAIT_SECONDS:
                         logger.warning(
                             "STORE_XPU slow D2H copy gi=%d chunk_idx=%d "
-                            "elapsed=%.3f s",
-                            gi, chunk_idx, _d2h_elapsed,
+                            "request_id=%s elapsed=%.3f s threshold=%.3f s",
+                            gi,
+                            chunk_idx,
+                            request_id,
+                            _d2h_elapsed,
+                            _XPU_SLOW_WAIT_SECONDS,
                         )
                 except RuntimeError as e:
                     logger.warning(
