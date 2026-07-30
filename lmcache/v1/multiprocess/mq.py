@@ -520,6 +520,12 @@ class MessageQueueServer:
         # Thread pools assigned via add_normal_thread_pool / add_affinity_thread_pool
         self.extra_pools: list[ThreadPoolExecutor | AffinityThreadPool] = []
 
+        # Map ZMQ client identity bytes → sequential slot index.
+        # Using a monotonically increasing counter instead of hash(identity)
+        # guarantees that N distinct clients are spread across N worker threads
+        # regardless of the hash distribution of the identity bytes.
+        self._identity_slots: dict[bytes, int] = {}
+
     def _call_sync_handler(
         self,
         handler_entry: SyncRequestHandler[Any],
@@ -558,7 +564,10 @@ class MessageQueueServer:
             prefix_frames (list[bytes]): The prefix frames to send back.
                 prefix_frames[0] is the zmq identity used as affinity key.
         """
-        affinity_key = hash(prefix_frames[0])
+        identity = prefix_frames[0]
+        if identity not in self._identity_slots:
+            self._identity_slots[identity] = len(self._identity_slots)
+        affinity_key = self._identity_slots[identity]
         future = handler_entry(payloads, affinity_key=affinity_key)
 
         def _notify_response(fut: Future):
