@@ -36,7 +36,7 @@ and never affects the existing retrieve performance baseline.
 
 # Standard
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 import os
 
@@ -50,7 +50,6 @@ from lmcache.v1.multiprocess.group_view import (
     get_engine_group_indices,
 )
 from lmcache.v1.multiprocess.transfer_context.xpu_broadcast import (
-    BroadcastFn,
     XpuBroadcastCoordinator,
 )
 

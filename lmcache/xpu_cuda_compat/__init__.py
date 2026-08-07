@@ -27,3 +27,19 @@ try:
     from lmcache.c_ops import PageBufferShapeDesc, multi_layer_block_kv_transfer
 except ImportError:
     pass
+
+# These names are re-exported so that ``bind_native(lmcache.xpu_cuda_compat)``
+# (see lmcache/v1/platform/base/device_ops.py) can enumerate and bind them onto
+# the CudaDeviceOps instance. ``bind_native`` walks ``dir(module)``, so keeping
+# them as module attributes is what makes the XPU compat shim loadable.
+__all__ = [
+    "GPUKVFormat",
+    "TransferDirection",
+    "alloc_hugepage_pinned_numa_ptr",
+    "alloc_hugepage_pinned_ptr",
+    "free_hugepage_pinned_numa_ptr",
+    "free_hugepage_pinned_ptr",
+    "lmcache_memcpy_async",
+    "PageBufferShapeDesc",
+    "multi_layer_block_kv_transfer",
+]

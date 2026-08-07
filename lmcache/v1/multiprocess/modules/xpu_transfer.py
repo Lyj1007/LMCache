@@ -275,9 +275,8 @@ def _layout_desc_from_groups(
     Returns:
         A :class:`MemoryLayoutDesc` covering all groups in ``groups`` order.
     """
-    # Compute per-group total page bytes using padded (max_page) layout.
+    # Compute per-group layout using padded (max_page) layout.
     # This wastes ~5% SHM but enables single bulk D2H/H2D without reformat.
-    group_page_bytes: dict[int, int] = {}
     group_layer_count: dict[int, int] = {}
     group_max_page: dict[int, int] = {}
     for h in layer_handles:
@@ -1314,7 +1313,10 @@ class XpuTransferModule:
                 padded_bytes = nl * n_blocks * max_page
                 try:
                     _d2h_st = time.perf_counter()
-                    dst_flat[:padded_bytes].copy_(staging_view.view(-1)[:padded_bytes], non_blocking=_XPU_STORE_DMA_NON_BLOCKING)
+                    dst_flat[:padded_bytes].copy_(
+                        staging_view.view(-1)[:padded_bytes],
+                        non_blocking=_XPU_STORE_DMA_NON_BLOCKING,
+                    )
                     _d2h_elapsed = time.perf_counter() - _d2h_st
                     if _d2h_elapsed >= _XPU_SLOW_WAIT_SECONDS:
                         logger.warning(
@@ -1346,7 +1348,7 @@ class XpuTransferModule:
         key: IPCCacheEngineKey,
         instance_id: int,
         block_ids: list[list[int]],
-        skip_blocks_per_group: list[int] = [],
+        skip_blocks_per_group: list[int] | None = None,
     ) -> bool:
         """Retrieve XPU KV cache chunks H2D from the L1 SHM pool.
 
@@ -1433,7 +1435,9 @@ class XpuTransferModule:
                             len(block_ids[gi]), dtype=torch.int64,
                             device=entry.device,
                         )
-                        dev_t.copy_(cpu_pinned, non_blocking=_XPU_RETRIEVE_DMA_NON_BLOCKING)
+                        dev_t.copy_(
+                            cpu_pinned, non_blocking=_XPU_RETRIEVE_DMA_NON_BLOCKING
+                        )
                         block_ids_dev_per_group.append(dev_t)
                     for chunk_idx, memory_obj in enumerate(memory_objs):
                         total_bytes += memory_obj.get_size()
@@ -1549,9 +1553,8 @@ class XpuTransferModule:
 
             # Copy host MemoryObj per-group tensor → staging buffer (H2D)
             src_tensor = memory_obj.get_tensor(gi)
-            staging_view = entry.retrieve_staging_buffer[:nl * n_blocks * max_page].view(
-                nl, n_blocks, max_page
-            )
+            staging_slice = entry.retrieve_staging_buffer[: nl * n_blocks * max_page]
+            staging_view = staging_slice.view(nl, n_blocks, max_page)
             if src_tensor is None:
                 continue
             src_flat = src_tensor.view(-1)

@@ -61,6 +61,7 @@ try:
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
+        LoadStoreOp,
         ParallelStrategy,
         send_lmcache_request,
     )
@@ -622,7 +623,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> None:
         """Enqueue MLA broadcasts for each retrieve op's MLA groups."""
         bpc = self.worker_adapter.blocks_in_chunk
-        for request_id, op in zip(request_ids, ops):
+        for request_id, op in zip(request_ids, ops, strict=False):
             # Get per-group block_ids in LMCache order
             block_ids_per_group = self.worker_adapter._block_ids_per_group(op)
             future_pair = self.worker_adapter.retrieve_futures.get(request_id)

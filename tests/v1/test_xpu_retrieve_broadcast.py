@@ -9,12 +9,10 @@ op exposes the new optional argument.
 """
 
 # Standard
-from collections.abc import Callable
 from typing import Any
 from unittest.mock import MagicMock
 
 # Third Party
-import pytest
 import torch
 
 # First Party
@@ -67,7 +65,7 @@ def _make_group_buffers(
     nl: int = 2,
     blocks_per_chunk: int = 4,
     max_page: int = 8,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device | None = None,
 ) -> _GroupBuffers:
     """Build a ``_GroupBuffers`` dummy that does not depend on XPU.
 
@@ -82,6 +80,8 @@ def _make_group_buffers(
         ``device``. The CPU default is fine for the dispatcher tests
         because the spy op never reads the data.
     """
+    if device is None:
+        device = torch.device("cpu")
     layer_tensors = [
         torch.zeros(blocks_per_chunk * 2, max_page, dtype=torch.int8, device=device)
         for _ in range(nl)
