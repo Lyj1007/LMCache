@@ -30,6 +30,38 @@ logger = init_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Kunlun KPU detection
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def is_kunlun_xpu() -> bool:
+    """Detect whether the current environment is Kunlun KPU with xmlir.
+
+    On Kunlun KPU, ``torch_xmlir`` is loaded and provides CUDA API
+    compatibility, so ``torch.cuda.is_available()`` reports True even though
+    the underlying hardware is Kunlun.  The KPU offload path uses this flag to
+    win device auto-detection ahead of the generic CUDA spec and to pick the
+    engine-driven transfer context.
+
+    Kept in this low-level module (rather than ``lmcache.__init__``) so that
+    :meth:`DeviceSpec.is_available` implementations and the multiprocess
+    transfer router can share it without importing ``lmcache.__init__`` and
+    triggering the platform import cycle.
+
+    Returns:
+        True when ``torch_xmlir`` can be imported, False otherwise.
+    """
+    try:
+        # Third Party
+        import torch_xmlir  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
@@ -99,6 +131,17 @@ def _detect_device() -> tuple[Any, str]:
                 "falling back to auto-detection.",
                 env_device_type,
             )
+
+    # Kunlun KPU exposes torch.cuda via xmlir, so CudaDeviceSpec.is_available()
+    # would otherwise win the generic (alphabetical) scan below and bind the
+    # CUDA native .so that cannot run on Kunlun hardware. Give the KPU spec
+    # priority so KpuDeviceOps (THP hugepages + xmlir memcpy) is selected.
+    if is_kunlun_xpu():
+        kpu_spec = registry.get("kpu")
+        if kpu_spec is not None and kpu_spec.is_available():
+            torch_module = getattr(torch, kpu_spec.torch_module_name, None)
+            if torch_module is not None:
+                return torch_module, kpu_spec.device_type
 
     for spec in registry.values():
         if not spec.is_available():

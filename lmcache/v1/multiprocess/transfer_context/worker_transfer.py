@@ -30,7 +30,11 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
-from lmcache.v1.platform import get_device_spec, resolve_kv_wrapper_factory
+from lmcache.v1.platform import (
+    get_device_spec,
+    get_torch_device,
+    resolve_kv_wrapper_factory,
+)
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
     get_event_ipc_backend,
@@ -886,6 +890,9 @@ def create_transfer_context(
     if resolved_mode is MPTransferMode.ENGINE_DRIVEN:
         return _build_engine_driven_context()
     # AUTO: dispatch by device type (CUDA -> handle path, else -> data path).
-    if device_type == "cuda":
+    # Kunlun KPU tensors report device.type == "cuda" (xmlir), but the CUDA
+    # IPC/handle (LMCache-driven) path does not work on Kunlun, so route the
+    # resolved-KPU case to the engine-driven (data) path instead.
+    if device_type == "cuda" and get_torch_device()[1] != "kpu":
         return LMCacheDrivenTransferContext()
     return _build_engine_driven_context()

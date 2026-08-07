@@ -12,6 +12,7 @@ from lmcache.logging import init_logger
 # --------------------------
 from lmcache.v1.platform import torch_dev as torch_dev
 from lmcache.v1.platform import torch_device_type as torch_device_type
+from lmcache.v1.platform._device_detect import is_kunlun_xpu as is_kunlun_xpu
 
 try:
     # First Party
@@ -21,7 +22,7 @@ except ImportError:
 
 logger = init_logger(__name__)
 
-__all__ = ["__version__", "torch_dev", "torch_device_type"]
+__all__ = ["__version__", "torch_dev", "torch_device_type", "is_kunlun_xpu"]
 
 
 # --------------------------
