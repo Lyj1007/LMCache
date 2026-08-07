@@ -35,7 +35,7 @@ logger = init_logger(__name__)
 
 
 @lru_cache(maxsize=1)
-def is_kunlun_xpu() -> bool:
+def is_kunlun_kpu() -> bool:
     """Detect whether the current environment is Kunlun KPU with xmlir.
 
     On Kunlun KPU, ``torch_xmlir`` is loaded and provides CUDA API
@@ -136,7 +136,7 @@ def _detect_device() -> tuple[Any, str]:
     # would otherwise win the generic (alphabetical) scan below and bind the
     # CUDA native .so that cannot run on Kunlun hardware. Give the KPU spec
     # priority so KpuDeviceOps (THP hugepages + xmlir memcpy) is selected.
-    if is_kunlun_xpu():
+    if is_kunlun_kpu():
         kpu_spec = registry.get("kpu")
         if kpu_spec is not None and kpu_spec.is_available():
             torch_module = getattr(torch, kpu_spec.torch_module_name, None)

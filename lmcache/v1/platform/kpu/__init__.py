@@ -21,7 +21,7 @@ Two consequences of that shim shape the backend:
   there is no interprocess event.
 
 Selection: auto-detected ahead of CUDA via
-:func:`lmcache.v1.platform._device_detect.is_kunlun_xpu` (see
+:func:`lmcache.v1.platform._device_detect.is_kunlun_kpu` (see
 ``_detect_device``), or forced explicitly with ``DEVICE_TYPE=kpu``.
 """
 
@@ -113,13 +113,13 @@ class KpuDeviceSpec(DeviceSpec):
     def is_available(self) -> bool:
         """Return True on a Kunlun KPU host (``torch_xmlir`` importable).
 
-        Uses the low-level :func:`is_kunlun_xpu` helper so this method never
+        Uses the low-level :func:`is_kunlun_kpu` helper so this method never
         imports ``lmcache.__init__`` (avoids the platform import cycle).
         """
         # First Party
-        from lmcache.v1.platform._device_detect import is_kunlun_xpu
+        from lmcache.v1.platform._device_detect import is_kunlun_kpu
 
-        return is_kunlun_xpu()
+        return is_kunlun_kpu()
 
     def is_handle_transfer_available(self) -> bool:
         """Kunlun supports handle transfer via raw device pointers.
