@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
 import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -78,6 +80,10 @@ _EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
 # default 10 s heartbeat interval (3 x 10 s); the adapter warns at startup
 # when 3 x heartbeat_interval exceeds it (server timeout must be raised too).
 _SERVER_REAP_TIMEOUT_FLOOR_SECONDS: float = 30.0
+
+# How many abandoned store events to keep alive. See
+# LMCacheMPWorkerAdapter._abandoned_store_events.
+_MAX_ABANDONED_STORE_EVENTS: int = 256
 
 
 def _resolve_extra_config(
@@ -1096,6 +1102,23 @@ class LMCacheMPWorkerAdapter:
         self.store_events: dict[str, _IpcEvent] = {}
         self.retrieve_events: dict[str, _IpcEvent] = {}
 
+        # Submission timestamps for in-flight stores, used to detect stalls.
+        self._store_submit_times: dict[str, float] = {}
+
+        # Seconds to wait for a store future before force-reporting the
+        # request as finished_sending. See _abandon_timed_out_stores.
+        # Set to 0 (or negative) to disable the escape hatch entirely.
+        self._store_timeout_seconds: float = float(
+            os.getenv("LMCACHE_STORE_TIMEOUT_SECONDS", "120")
+        )
+
+        # Events of abandoned stores. The server may still hold an imported
+        # handle for them, and freeing the exporting event underneath it is a
+        # use-after-free in the driver, so they are parked here instead of
+        # dropped. Bounded so a pathological run cannot grow without limit;
+        # eviction only happens long after the timeout has already elapsed.
+        self._abandoned_store_events: OrderedDict[str, _IpcEvent] = OrderedDict()
+
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
 
@@ -1412,6 +1435,7 @@ class LMCacheMPWorkerAdapter:
         )
         self.store_futures[request_id] = future
         self.store_events[request_id] = event
+        self._store_submit_times[request_id] = time.monotonic()
 
     @_lmcache_nvtx_annotate
     def submit_retrieve_request(
@@ -1520,6 +1544,64 @@ class LMCacheMPWorkerAdapter:
         for request_id, op, salt in zip(request_ids, ops, cache_salts, strict=False):
             self.submit_retrieve_request(request_id, op, event, cache_salt=salt)
 
+    def _is_store_stalled(self, request_id: str, now: float) -> bool:
+        """Whether an in-flight store has outlived the abandon timeout.
+
+        Args:
+            request_id: The request whose store future is still pending.
+            now: A ``time.monotonic()`` reading shared across one sweep.
+
+        Returns:
+            True if the store should be abandoned.
+        """
+        if self._store_timeout_seconds <= 0:
+            return False
+        submit_time = self._store_submit_times.get(request_id)
+        if submit_time is None:
+            return False
+        return now - submit_time > self._store_timeout_seconds
+
+    def _abandon_timed_out_stores(self, request_ids: set[str]) -> None:
+        """Stop waiting on stores that never completed.
+
+        The vLLM scheduler holds a request's GPU blocks until the connector
+        reports it in finished_sending. A store future that never resolves --
+        the server dropped the object mid-flight, or its queue backed up --
+        therefore pins those blocks forever, and the engine deadlocks once the
+        KV cache fills up. Reporting the request anyway trades a bounded risk
+        for liveness.
+
+        On the engine-driven path the KV bytes are already in a staging buffer
+        by the time the future is outstanding, so abandoning only loses the
+        cache entry. On the LMCache-driven path the server reads the worker's
+        device memory directly, so blocks freed here may be overwritten while
+        it is still reading, and the entry it commits can be garbage that a
+        later prefix hit would silently serve. Reaching a 120 s timeout
+        already means the store path is broken; set
+        LMCACHE_STORE_TIMEOUT_SECONDS=0 to disable the escape hatch and let
+        such deployments hang visibly instead.
+
+        Args:
+            request_ids: Requests whose stores are being given up on.
+        """
+        for request_id in request_ids:
+            logger.warning(
+                "Store for request_id=%s did not complete within %.1fs; "
+                "reporting it as finished so the scheduler can reclaim its "
+                "GPU blocks. Its cache entry may be incomplete.",
+                request_id,
+                self._store_timeout_seconds,
+            )
+            event = self.store_events.pop(request_id, None)
+            if event is None:
+                continue
+            # The server may still hold an imported handle for this event.
+            # Freeing the exporting object underneath it is a use-after-free
+            # in the driver, so park it instead of dropping it.
+            self._abandoned_store_events[request_id] = event
+            while len(self._abandoned_store_events) > _MAX_ABANDONED_STORE_EVENTS:
+                self._abandoned_store_events.popitem(last=False)
+
     def _process_finished_stores(
         self,
         finished_req_ids_from_lmcache: set[str],
@@ -1582,6 +1664,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.clear()
             self.store_events.clear()
             self.retrieve_events.clear()
+            self._store_submit_times.clear()
 
             # Retrieves dropped at submit time still must be reported,
             # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
@@ -1605,8 +1688,12 @@ class LMCacheMPWorkerAdapter:
 
         finished_stores = set()
         finished_retrieves = set()
+        stalled_stores = set()
+        now = time.monotonic()
         for request_id, s_future in self.store_futures.items():
             if not s_future.query():
+                if self._is_store_stalled(request_id, now):
+                    stalled_stores.add(request_id)
                 continue
 
             s_result = s_future.result(timeout=60)
@@ -1634,10 +1721,16 @@ class LMCacheMPWorkerAdapter:
                     r_result,
                 )
 
+        # Stalled stores are reported as finished so the scheduler can reclaim
+        # their GPU blocks; this also moves their events out of store_events.
+        self._abandon_timed_out_stores(stalled_stores)
+        finished_stores |= stalled_stores
+
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
             self.store_events.pop(request_id, None)
+            self._store_submit_times.pop(request_id, None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)

@@ -355,6 +355,96 @@ def test_store_keeps_event_until_future_finishes(fake_adapter):
     assert event_ref() is None
 
 
+def _pending_store(adapter, request_id: str, event: object | None = None) -> MagicMock:
+    """Submit a store whose future never completes. Returns the transfer ctx."""
+    store_future = MagicMock(name="store_future")
+    store_future.query.return_value = False
+    transfer_ctx = MagicMock()
+    transfer_ctx.submit_store.return_value = store_future
+    adapter.transfer_ctx = transfer_ctx
+    adapter.submit_store_request(
+        request_id, _op([[0]]), event if event is not None else MagicMock()
+    )
+    return transfer_ctx
+
+
+def test_pending_store_is_not_reported_before_timeout(fake_adapter):
+    """A store still within its deadline keeps the request's blocks pinned."""
+    adapter, _send_mock, _future = fake_adapter
+    _pending_store(adapter, "req-1")
+
+    ret_stores, _ = adapter.get_finished({"req-1"})
+
+    assert ret_stores == set()
+    assert "req-1" in adapter.store_futures
+
+
+def test_stalled_store_is_reported_finished_after_timeout(fake_adapter):
+    """A store past its deadline is abandoned so the scheduler can reclaim
+    the request's GPU blocks instead of deadlocking on a stuck future."""
+    adapter, _send_mock, _future = fake_adapter
+    _pending_store(adapter, "req-1")
+    adapter._store_submit_times["req-1"] -= adapter._store_timeout_seconds + 1
+
+    ret_stores, _ = adapter.get_finished({"req-1"})
+
+    assert ret_stores == {"req-1"}
+    # Tracking state is dropped, so a later poll cannot re-report it.
+    assert "req-1" not in adapter.store_futures
+    assert "req-1" not in adapter.store_events
+    assert "req-1" not in adapter._store_submit_times
+    assert adapter.get_finished({"req-1"})[0] == set()
+
+
+def test_stalled_store_keeps_its_event_alive(fake_adapter):
+    """Abandoning a store must not free the exporting event: the server may
+    still hold an imported handle, and freeing it is a driver-level UAF."""
+    adapter, _send_mock, _future = fake_adapter
+    event = FakeCudaEvent()
+    event_ref = weakref.ref(event)
+    transfer_ctx = _pending_store(adapter, "req-1", event)
+    del event
+    adapter._store_submit_times["req-1"] -= adapter._store_timeout_seconds + 1
+
+    assert adapter.get_finished({"req-1"})[0] == {"req-1"}
+
+    # Drop the recorded call args, otherwise the mock alone keeps it alive.
+    transfer_ctx.reset_mock()
+    gc.collect()
+    assert event_ref() is not None
+    assert "req-1" in adapter._abandoned_store_events
+
+
+def test_abandoned_store_events_are_bounded(fake_adapter):
+    """The abandoned-event quarantine cannot grow without limit."""
+    adapter, _send_mock, _future = fake_adapter
+    limit = adapter_mod._MAX_ABANDONED_STORE_EVENTS
+    for i in range(limit + 5):
+        req_id = f"req-{i}"
+        _pending_store(adapter, req_id, FakeCudaEvent())
+        adapter._store_submit_times[req_id] -= adapter._store_timeout_seconds + 1
+        adapter.get_finished({req_id})
+
+    assert len(adapter._abandoned_store_events) == limit
+    # Oldest entries are evicted first.
+    assert "req-0" not in adapter._abandoned_store_events
+    assert f"req-{limit + 4}" in adapter._abandoned_store_events
+
+
+def test_store_timeout_can_be_disabled(fake_adapter):
+    """LMCACHE_STORE_TIMEOUT_SECONDS=0 keeps the pre-existing behaviour of
+    waiting indefinitely rather than risking a partial cache entry."""
+    adapter, _send_mock, _future = fake_adapter
+    adapter._store_timeout_seconds = 0.0
+    _pending_store(adapter, "req-1")
+    adapter._store_submit_times["req-1"] -= 10_000
+
+    ret_stores, _ = adapter.get_finished({"req-1"})
+
+    assert ret_stores == set()
+    assert "req-1" in adapter.store_futures
+
+
 def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
     """Retrieve requests keep the exported CUDA event alive while pending."""
     adapter, _send_mock, _future = fake_adapter
