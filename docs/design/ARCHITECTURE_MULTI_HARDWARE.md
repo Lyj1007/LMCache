@@ -16,7 +16,7 @@ multiprocess (MP) mode.
 │        └──────────────────┴──────────────────┘                  │
 │                           │                                     │
 │                     torch_dev (unified entry)                   │
-│              torch_device_type (e.g. "cuda"/"musa"/"xpu"/       │
+│              torch_device_type (e.g. "cuda"/"musa"/"xpu"/"kpu"/ │
 │                                 "hpu"/"cpu"; auto-discoverable) │
 │                                                                 │
 │  [Registry Discovery Point]                                     │
@@ -90,7 +90,7 @@ multiprocess (MP) mode.
 | **Entry** `v1/platform/__init__.py` | `_detect_device()` + `get_backend()` | Registry-driven detection and backend composition. |
 | **Middle** engine / storage / multiprocess | `from lmcache import torch_dev` | Hardware-agnostic unified code |
 | **Middle** IPC-capable / device-specific APIs | `hasattr(torch_dev, 'xxx')` guard | Graceful runtime degradation |
-| **Bottom** Transfer Context | `create_transfer_context(kv_caches, mode)` | Per-device routing. In `AUTO` mode: CUDA→LMCacheDriven, other devices→EngineDriven. Other IPC-capable devices (e.g. MUSA) can opt-in to LMCacheDriven via explicit `mode=lmcache_driven` when their `DeviceSpec` reports `is_handle_transfer_available() == True`. |
+| **Bottom** Transfer Context | `create_transfer_context(kv_caches, mode)` | Per-device routing. In `AUTO` mode: CUDA→LMCacheDriven, other devices→EngineDriven. Other IPC-capable devices (e.g. MUSA, KPU) can opt-in to LMCacheDriven via explicit `mode=lmcache_driven` when their `DeviceSpec` reports `is_handle_transfer_available() == True`. KPU additionally ships a raw-pointer `KpuPtrIPCWrapper` and an MQ-ordered `KpuEventIPCBackend` because Kunlun has no CUDA-style IPC handle or interprocess event. |
 
 ## Transfer Mode Routing (`transfer_context/worker_transfer.py`)
 
@@ -113,7 +113,7 @@ Override: LMCACHE_MP_TRANSFER_MODE env var or the mode argument to create_transf
 ## CPU-Only Stub Fallback
 
 `_detect_device()` also accepts a CPU-only environment where none of the
-supported accelerators (CUDA, MUSA, XPU, HPU) is available. In that case
+supported accelerators (CUDA, MUSA, XPU, HPU, KPU) is available. In that case
 `torch_device_type` is `"cpu"` and `torch_dev` is either:
 
 - `lmcache.v1.platform.cpu.stub_cpu_device.StubCPUDevice` — when `torch`

@@ -112,6 +112,22 @@ Key properties:
    PyTorch itself (like ``torch.cuda``) a plain
    ``torch.foo.is_available()`` is enough.
 
+.. note::
+
+   **Shim-based backends.** Some accelerators drive PyTorch through a
+   compatibility shim that reuses another backend's ``torch`` module.
+   Kunlun KPU (``lmcache/v1/platform/kpu/``) is the canonical example:
+   it runs on ``torch_xmlir`` which exposes the device as
+   ``torch.cuda``, so ``torch_module_name`` returns ``"cuda"`` while
+   ``device_type`` is ``"kpu"``.  Such a backend must keep
+   ``device_type`` distinct from the borrowed module name and resolve it
+   at registry-lookup time (see ``normalize_device_type``); otherwise
+   tensors that misreport their device type would silently bind the
+   wrong ``DeviceSpec``.  Because Kunlun has no CUDA-style IPC handle or
+   interprocess event, KPU overrides ``ipc_wrapper_cls`` with a raw
+   pointer wrapper (``KpuPtrIPCWrapper``) and ``event_ipc_backend`` with
+   an MQ-ordered backend (``KpuEventIPCBackend``).
+
 That's it.  Defining this class is enough for auto-discovery — no
 global list or manual registration call is required.  All ops
 automatically route through ``lmcache.python_ops_fallback``, which is
@@ -254,7 +270,12 @@ Implementation notes
   imported eagerly during ``get_backend()``.
 
 For concrete reference implementations, see
-``lmcache/v1/platform/cuda/`` and ``lmcache/v1/platform/musa/``.
+``lmcache/v1/platform/cuda/`` (engine-driven baseline),
+``lmcache/v1/platform/musa/`` (LMCache-driven capable), and
+``lmcache/v1/platform/kpu/`` (Kunlun: a shim-based backend whose
+``torch_module_name`` is ``"cuda"`` while its ``device_type`` is
+``"kpu"``; it transfers KV caches as raw device pointers via
+``KpuPtrIPCWrapper``).
 Both are examples of what a vendor *may* do, not templates every new
 backend has to follow.
 
