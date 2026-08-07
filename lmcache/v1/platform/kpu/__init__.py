@@ -4,9 +4,21 @@
 Kunlun KPU runs PyTorch through ``torch_xmlir``, which exposes the device as
 ``torch.cuda`` (``torch.cuda.is_available()`` reports True and tensors report
 ``device.type == "cuda"``).  This backend therefore reuses the CUDA torch
-module name while providing Kunlun-specific host memory ops and forcing the
-engine-driven (data) multiprocess transfer path -- the CUDA IPC/handle path
-does not work on Kunlun.
+module name while overriding everything CUDA-specific underneath it.
+
+Two consequences of that shim shape the backend:
+
+* **Device resolution.** Because tensors lie about their device type, registry
+  lookups keyed on ``tensor.device.type`` would bind the CUDA spec and hand
+  back CUDA IPC handles and CUDA events that Kunlun cannot honour.
+  :func:`lmcache.v1.platform._device_detect.normalize_device_type` maps the
+  borrowed ``"cuda"`` back onto ``"kpu"`` for every registry lookup.
+* **Transfer path.** Kunlun memory is a flat, cross-process addressable
+  space, so the LMCache-driven path works -- but via raw device pointers
+  (:class:`~lmcache.v1.platform.kpu.ipc_wrapper.KpuPtrIPCWrapper`) rather than
+  IPC handles, and ordered through the message queue
+  (:class:`~lmcache.v1.platform.kpu.event_ipc.KpuEventIPCBackend`) because
+  there is no interprocess event.
 
 Selection: auto-detected ahead of CUDA via
 :func:`lmcache.v1.platform._device_detect.is_kunlun_xpu` (see
@@ -26,9 +38,13 @@ from lmcache.v1.platform.kpu.pin_memory import KpuPinMemoryBackend
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        TransferContext,
+    )
     from lmcache.v1.platform.base.cache_context import BaseCacheContext
     from lmcache.v1.platform.base.device_ops import DeviceOps
     from lmcache.v1.platform.base.event_ipc import EventIPCBackend
+    from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
 
 # ---------------------------------------------------------------------------
 # Device detection registry entry
@@ -61,22 +77,38 @@ class KpuDeviceSpec(DeviceSpec):
         return KpuPinMemoryBackend
 
     @property
+    def ipc_wrapper_cls(self) -> type[DeviceIPCWrapper] | None:
+        """Ship KV caches as raw device pointers.
+
+        Kunlun's flat address space is directly addressable across processes,
+        so the server maps worker memory without any IPC handle exchange.
+        """
+        # First Party
+        from lmcache.v1.platform.kpu.ipc_wrapper import KpuPtrIPCWrapper
+
+        return KpuPtrIPCWrapper
+
+    @property
     def event_ipc_backend(self) -> "EventIPCBackend":
-        """Return the KPU event IPC backend (torch.cuda events via xmlir)."""
+        """Return the Kunlun event backend (MQ-ordered, no interprocess event)."""
         backend = self._event_backend_cache
         if backend is None:
-            # Third Party
-            import torch
-
             # First Party
-            from lmcache.v1.platform.base.event_ipc import DefaultEventIPCBackend
+            from lmcache.v1.platform.kpu.event_ipc import KpuEventIPCBackend
 
-            backend = DefaultEventIPCBackend(
-                event_module=torch.cuda,
-                device_type=self.device_type,
-            )
+            backend = KpuEventIPCBackend()
             self._event_backend_cache = backend
         return backend
+
+    @property
+    def handle_transfer_context_cls(self) -> "type[TransferContext] | None":
+        """Use the Kunlun pointer context so event blocks leave the hot path."""
+        # First Party
+        from lmcache.v1.multiprocess.transfer_context.kpu_transfer import (
+            KpuDevicePtrTransferContext,
+        )
+
+        return KpuDevicePtrTransferContext
 
     def is_available(self) -> bool:
         """Return True on a Kunlun KPU host (``torch_xmlir`` importable).
@@ -90,13 +122,16 @@ class KpuDeviceSpec(DeviceSpec):
         return is_kunlun_xpu()
 
     def is_handle_transfer_available(self) -> bool:
-        """Kunlun cannot use the CUDA IPC/handle transfer path.
+        """Kunlun supports handle transfer via raw device pointers.
 
-        Returning False routes AUTO multiprocess transfer to the
-        engine-driven (data) path, which is the correctness baseline for
-        Kunlun KPU offload.
+        Note this is *not* the CUDA IPC handle path: see
+        :attr:`ipc_wrapper_cls` and :attr:`event_ipc_backend`.
         """
-        return False
+        return True
+
+    def prefers_handle_transfer(self) -> bool:
+        """Default Kunlun to the pointer path; it avoids worker-side copies."""
+        return True
 
     def create_cache_context(self, *args: Any, **kwargs: Any) -> "BaseCacheContext":
         """Reuse the GPU cache context (KPU tensors are torch.cuda via xmlir)."""

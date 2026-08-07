@@ -30,6 +30,7 @@ __all__ = [
     "DeviceSpec",
     "get_device_spec",
     "get_torch_device",
+    "normalize_device_type",
     "resolve_device_ops",
     "torch_dev",
     "torch_device_type",
@@ -53,6 +54,9 @@ from lmcache.v1.platform._device_detect import (
 from lmcache.v1.platform._device_detect import get_device_spec as get_device_spec
 from lmcache.v1.platform._device_detect import (
     get_torch_device,
+)
+from lmcache.v1.platform._device_detect import (
+    normalize_device_type as normalize_device_type,
 )
 from lmcache.v1.platform.base.device_spec import DeviceSpec
 from lmcache.v1.utils.subclass_discovery import discover_subclasses
@@ -179,6 +183,10 @@ def resolve_kv_wrapper_factory(device_type: str) -> Any:
     class itself when no ``wrap`` is defined) so callers can invoke
     ``factory(tensor)`` uniformly.
 
+    *device_type* is normalized first, so accelerators that borrow another
+    backend's torch module (Kunlun KPU reports ``device.type == "cuda"``)
+    resolve to their own wrapper instead of the borrowed backend's.
+
     Args:
         device_type: The device type string (e.g. ``"cuda"``).
 
@@ -189,6 +197,7 @@ def resolve_kv_wrapper_factory(device_type: str) -> Any:
     Raises:
         ValueError: If no spec / wrapper is registered for *device_type*.
     """
+    device_type = normalize_device_type(device_type)
     spec = _DEVICE_REGISTRY.get(device_type)
     wrapper_cls = spec.ipc_wrapper_cls if spec is not None else None
     if wrapper_cls is None:
@@ -210,9 +219,13 @@ def _resolve_device_spec(device_type: str) -> DeviceSpec:
     :class:`DeviceSpec` fallback.  If ``"cpu"`` is absent from the registry
     (e.g. tests strip it), it also falls back.
 
+    *device_type* is normalized first so a shim-based accelerator (Kunlun KPU
+    over ``torch.cuda``) binds its own ops rather than the borrowed backend's.
+
     Raises:
         RuntimeError: If an accelerator device has no registered spec.
     """
+    device_type = normalize_device_type(device_type)
     dev_spec = _DEVICE_REGISTRY.get(device_type)
     if dev_spec is not None:
         return dev_spec

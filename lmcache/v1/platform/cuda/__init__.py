@@ -73,6 +73,10 @@ class CudaDeviceSpec(DeviceSpec):
 
         return CudaIPCWrapper
 
+    def prefers_handle_transfer(self) -> bool:
+        """CUDA defaults to the LMCache-driven (IPC handle) transfer path."""
+        return True
+
     def is_available(self) -> bool:
         """Check CUDA availability without importing lmcache.__init__."""
         try:

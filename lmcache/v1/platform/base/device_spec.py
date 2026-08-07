@@ -34,6 +34,9 @@ from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        TransferContext,
+    )
     from lmcache.v1.platform.base.cache_context import BaseCacheContext
     from lmcache.v1.platform.base.device_ops import DeviceOps
     from lmcache.v1.platform.base.event_ipc import EventIPCBackend
@@ -125,6 +128,34 @@ class DeviceSpec:
         """Return ``True`` when the device is usable for handle transfer."""
         # TODO(chunxiaozheng): implement on subclasses
         return True
+
+    def prefers_handle_transfer(self) -> bool:
+        """Whether ``AUTO`` multiprocess routing should pick the handle path.
+
+        :func:`~lmcache.v1.multiprocess.transfer_context.worker_transfer.create_transfer_context`
+        consults this instead of testing device-type strings, so each backend
+        declares its own default and the router stays free of if/elif chains.
+
+        Defaults to ``False`` -- the engine-driven (data) path is the
+        correctness baseline -- so a backend only opts in once its handle
+        transport is known to work.
+        """
+        return False
+
+    @property
+    def handle_transfer_context_cls(self) -> "type[TransferContext] | None":
+        """Device-specific handle-path transfer context, or ``None``.
+
+        ``None`` selects the generic
+        :class:`~lmcache.v1.multiprocess.transfer_context.worker_transfer.LMCacheDrivenTransferContext`.
+        Backends override this only when the handle path needs different
+        submission mechanics (e.g. Kunlun KPU, which has no interprocess event
+        and must drain events off the caller's thread).
+
+        Use a lazy import inside the property body to keep multiprocess
+        modules out of the platform base import graph.
+        """
+        return None
 
     @property
     def event_ipc_backend(self) -> "EventIPCBackend | None":

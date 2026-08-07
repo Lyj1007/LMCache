@@ -32,7 +32,7 @@ from lmcache.v1.multiprocess.transfer_context.base import (
 )
 from lmcache.v1.platform import (
     get_device_spec,
-    get_torch_device,
+    normalize_device_type,
     resolve_kv_wrapper_factory,
 )
 from lmcache.v1.platform.base.event_ipc import (
@@ -149,7 +149,13 @@ def _resolve_mode(mode: "str | MPTransferMode | None") -> MPTransferMode:
 
 
 def _build_lmcache_driven_context(device_type: str) -> "TransferContext":
-    """Build a :class:`LMCacheDrivenTransferContext` after capability check."""
+    """Build the handle-path transfer context after a capability check.
+
+    Devices may supply their own handle-path implementation via
+    :attr:`~lmcache.v1.platform.base.device_spec.DeviceSpec.handle_transfer_context_cls`
+    (Kunlun KPU does); otherwise the generic
+    :class:`LMCacheDrivenTransferContext` is used.
+    """
     try:
         resolve_kv_wrapper_factory(device_type)
     except ValueError as exc:
@@ -165,6 +171,14 @@ def _build_lmcache_driven_context(device_type: str) -> "TransferContext":
             "%r: required platform capability checks failed. "
             "Use mode 'engine_driven' or 'auto' instead." % device_type
         )
+    context_cls = device_spec.handle_transfer_context_cls if device_spec else None
+    if context_cls is not None:
+        logger.info(
+            "Using %s for the handle path on device type %r",
+            context_cls.__name__,
+            device_type,
+        )
+        return context_cls()
     return LMCacheDrivenTransferContext()
 
 
@@ -878,7 +892,10 @@ def create_transfer_context(
         raise ValueError(
             f"All KV cache tensors must share one device type, got {device_types}"
         )
-    device_type = next(iter(device_types))
+    # Normalize before routing: a Kunlun KPU tensor reports
+    # ``device.type == "cuda"`` (xmlir), and every capability lookup below
+    # must see ``"kpu"`` so it binds the Kunlun spec rather than CUDA's.
+    device_type = normalize_device_type(next(iter(device_types)))
     resolved_mode = _resolve_mode(mode)
     logger.info(
         "Creating transfer context (device_type=%s, mode=%s)",
@@ -889,10 +906,10 @@ def create_transfer_context(
         return _build_lmcache_driven_context(device_type)
     if resolved_mode is MPTransferMode.ENGINE_DRIVEN:
         return _build_engine_driven_context()
-    # AUTO: dispatch by device type (CUDA -> handle path, else -> data path).
-    # Kunlun KPU tensors report device.type == "cuda" (xmlir), but the CUDA
-    # IPC/handle (LMCache-driven) path does not work on Kunlun, so route the
-    # resolved-KPU case to the engine-driven (data) path instead.
-    if device_type == "cuda" and get_torch_device()[1] != "kpu":
-        return LMCacheDrivenTransferContext()
+    # AUTO: each backend declares whether it wants the handle path, so this
+    # router stays free of device-type special cases. Everything else falls
+    # back to the engine-driven (data) path, the correctness baseline.
+    device_spec = get_device_spec(device_type)
+    if device_spec is not None and device_spec.prefers_handle_transfer():
+        return _build_lmcache_driven_context(device_type)
     return _build_engine_driven_context()
