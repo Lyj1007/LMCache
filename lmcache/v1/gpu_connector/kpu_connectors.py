@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
+class VLLMPagedMemKPUConnectorV2(GPUConnectorInterface):
     """
     The GPU KV cache should be a nested tuple of K and V tensors.
     More specifically, we have:
@@ -82,8 +82,8 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
             )
 
-        self.store_stream = torch.xpu.Stream()
-        self.load_stream = torch.xpu.Stream()
+        self.store_stream = torch.cuda.Stream()
+        self.load_stream = torch.cuda.Stream()
 
     @classmethod
     def from_metadata(
@@ -91,7 +91,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         metadata: "LMCacheMetadata",
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
-    ) -> "VLLMPagedMemXPUConnectorV2":
+    ) -> "VLLMPagedMemKPUConnectorV2":
         """Create a connector from LMCacheMetadata.
 
         Args:
@@ -100,7 +100,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
             device: The device to use for the connector.
 
         Returns:
-            A new instance of VLLMPagedMemXPUConnectorV2.
+            A new instance of VLLMPagedMemKPUConnectorV2.
         """
         # Extract parameters from metadata
         # kv_shape: (num_layer, 2 or 1, chunk_size, num_kv_head, head_size)
@@ -122,7 +122,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
         self.device = kv_caches[0].device
-        assert self.device.type == "xpu", "The device should be XPU."
+        assert self.device.type in ("xpu", "cuda"), "Kunlun KPU runs via xmlir; torch device.type must be xpu or cuda."
         idx = self.device.index
         if idx in self.kv_cache_pointers_on_gpu:
             return self.kv_cache_pointers_on_gpu[idx]
@@ -171,13 +171,13 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
                 raise ValueError(
                     "The memory object should be in KV_MLA_FMT format in"
-                    " order to be processed by VLLMPagedMemXPUConnector"
+                    " order to be processed by VLLMPagedMemKPUConnector"
                 )
         else:
             if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
                 raise ValueError(
                     "The memory object should be in KV_2LTD format in"
-                    " order to be processed by VLLMPagedMemXPUConnector"
+                    " order to be processed by VLLMPagedMemKPUConnector"
                 )
 
         if "slot_mapping" not in kwargs:
@@ -238,7 +238,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
-        with torch.xpu.stream(self.store_stream):
+        with torch.cuda.stream(self.store_stream):
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 lmc_ops.multi_layer_kv_transfer(
                     memory_obj.tensor,
@@ -277,7 +277,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        with torch.xpu.stream(self.load_stream):
+        with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
         self.load_stream.synchronize()
@@ -292,14 +292,14 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
 
 
-class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
+class VLLMPagedMemKPUConnectorV3(GPUConnectorInterface):
     def __init__(
         self,
         metadata: "LMCacheMetadata",
         device: torch.device,
         use_gpu: bool = False,
     ):
-        assert device.type == "xpu", "The device should be XPU."
+        assert device.type in ("xpu", "cuda"), "Kunlun KPU runs via xmlir; torch device.type must be xpu or cuda."
         self.metadata = metadata
         self.device = device
         self.use_mla = metadata.use_mla
@@ -312,8 +312,8 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         self.group_kv_cache_pointers_on_gpu: Optional[list[torch.Tensor]] = None
         self.group_tmp_buffer: Optional[list[torch.Tensor]] = None
 
-        self.store_stream = torch.xpu.Stream()
-        self.load_stream = torch.xpu.Stream()
+        self.store_stream = torch.cuda.Stream()
+        self.load_stream = torch.cuda.Stream()
 
     @classmethod
     def from_metadata(
@@ -321,7 +321,7 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         metadata: "LMCacheMetadata",
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
-    ) -> "VLLMPagedMemXPUConnectorV3":
+    ) -> "VLLMPagedMemKPUConnectorV3":
         assert device is not None
         return cls(metadata, device, use_gpu)
 
@@ -366,7 +366,7 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         self.page_buffer_size = self.num_blocks * self.block_size
 
         self.init = True
-        logger.info("init kv cache pointers success in VLLMPagedMemXPUConnectorV3")
+        logger.info("init kv cache pointers success in VLLMPagedMemKPUConnectorV3")
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -416,7 +416,7 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
         assert self.group_kv_cache_pointers_on_gpu is not None
-        with torch.xpu.stream(self.store_stream):
+        with torch.cuda.stream(self.store_stream):
             if not self.use_gpu or end - start != self.chunk_size:
                 for i, kv_cache_pointer in enumerate(
                     self.group_kv_cache_pointers_on_gpu
@@ -464,7 +464,7 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        with torch.xpu.stream(self.load_stream):
+        with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
         self.load_stream.synchronize()
@@ -477,7 +477,7 @@ class VLLMPagedMemXPUConnectorV3(GPUConnectorInterface):
         raise NotImplementedError
 
 
-class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
+class VLLMBufferLayerwiseKPUConnector(GPUConnectorInterface):
     def __init__(
         self,
         hidden_dim_size: int,
@@ -496,15 +496,15 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
 
         self.fused_rotary_emb = None
 
-        assert use_gpu, "use_gpu must be true in VLLMBufferLayerwiseXPUConnector"
+        assert use_gpu, "use_gpu must be true in VLLMBufferLayerwiseKPUConnector"
         assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
         assert "device" in kwargs, "device should be provided to create a GPU buffer."
 
         self.dtype = kwargs["dtype"]
         self.device = kwargs["device"]
 
-        self.load_stream = torch.xpu.Stream()
-        self.store_stream = torch.xpu.Stream()
+        self.load_stream = torch.cuda.Stream()
+        self.store_stream = torch.cuda.Stream()
 
         self.buffer_mapping: dict[int, MemoryObj] = {}
 
@@ -521,7 +521,7 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
         metadata: "LMCacheMetadata",
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
-    ) -> "VLLMBufferLayerwiseXPUConnector":
+    ) -> "VLLMBufferLayerwiseKPUConnector":
         """Create a connector from LMCacheMetadata.
 
         Args:
@@ -530,7 +530,7 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
             device: The device to use for the connector.
 
         Returns:
-            A new instance of VLLMBufferLayerwiseXPUConnector.
+            A new instance of VLLMBufferLayerwiseKPUConnector.
         """
         # Extract parameters from metadata
         # kv_shape: (num_layer, 2 or 1, chunk_size, num_kv_head, head_size)
@@ -672,7 +672,7 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
         assert compute_gpu_buffer_obj.tensor is not None
         assert load_gpu_buffer_obj.tensor is not None
 
-        # current_stream = torch.xpu.current_stream()
+        # current_stream = torch.cuda.current_stream()
 
         if self.cache_positions:
             old_positions_full = torch.zeros(
@@ -694,7 +694,7 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
 
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
-                torch.xpu.synchronize()
+                torch.cuda.synchronize()
 
                 # ping-pong the buffers
                 compute_gpu_buffer_obj, load_gpu_buffer_obj = (
@@ -723,7 +723,7 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
                 memory_objs_layer = yield
 
                 # memobj -> gpu_buffer
-                with torch.xpu.stream(self.load_stream):
+                with torch.cuda.stream(self.load_stream):
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
@@ -833,12 +833,12 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
         )
         assert tmp_gpu_buffer_obj.tensor is not None
 
-        current_stream = torch.xpu.current_stream()
+        current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
-            with torch.xpu.stream(self.store_stream):
+            with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
                 lmc_ops.single_layer_kv_transfer(
                     tmp_gpu_buffer_obj.tensor,
@@ -878,7 +878,7 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
         return torch.Size([2, num_tokens, self.hidden_dim_size])
 
 
-class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
+class VLLMPagedMemLayerwiseKPUConnector(GPUConnectorInterface):
     """ """
 
     def __init__(
@@ -908,8 +908,8 @@ class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
         # All sizes are in bytes
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
-        self.load_stream = torch.xpu.Stream()
-        self.store_stream = torch.xpu.Stream()
+        self.load_stream = torch.cuda.Stream()
+        self.store_stream = torch.cuda.Stream()
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 
@@ -919,7 +919,7 @@ class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
         metadata: "LMCacheMetadata",
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
-    ) -> "VLLMPagedMemLayerwiseXPUConnector":
+    ) -> "VLLMPagedMemLayerwiseKPUConnector":
         """Create a connector from LMCacheMetadata.
 
         Args:
@@ -928,7 +928,7 @@ class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
             device: The device to use for the connector.
 
         Returns:
-            A new instance of VLLMPagedMemLayerwiseXPUConnector.
+            A new instance of VLLMPagedMemLayerwiseKPUConnector.
         """
         # Extract parameters from metadata
         # kv_shape: (num_layer, 2 or 1, chunk_size, num_kv_head, head_size)
@@ -1049,7 +1049,7 @@ class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
-        current_stream = torch.xpu.current_stream()
+        current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
@@ -1059,7 +1059,7 @@ class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
             # memobj -> gpu_buffer -> kvcaches
-            with torch.xpu.stream(self.load_stream):
+            with torch.cuda.stream(self.load_stream):
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
@@ -1179,12 +1179,12 @@ class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
-        current_stream = torch.xpu.current_stream()
+        current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
-            with torch.xpu.stream(self.store_stream):
+            with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
                 if self.use_gpu:
                     lmc_ops.single_layer_kv_transfer(
@@ -1237,7 +1237,7 @@ class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
             return torch.Size([num_tokens, 2, self.hidden_dim_size])
 
 
-class SGLangXPUConnector(GPUConnectorInterface):
+class SGLangKPUConnector(GPUConnectorInterface):
     """
     The GPU KV cache should be a list of tensors, one for each layer,
     with separate key and value pointers.
@@ -1302,7 +1302,7 @@ class SGLangXPUConnector(GPUConnectorInterface):
         )
 
         self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in flat_kv_caches]
-        assert device.type == "xpu", "The device should be XPU."
+        assert device.type in ("xpu", "cuda"), "Kunlun KPU runs via xmlir; torch device.type must be xpu or cuda."
         idx = device.index
         if idx not in self.kv_cache_pointers_on_gpu:
             self.kv_cache_pointers_on_gpu[idx] = torch.empty(
@@ -1432,7 +1432,7 @@ class SGLangXPUConnector(GPUConnectorInterface):
             # Force a synchronize if the target buffer is NOT XPU device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
-            torch.xpu.synchronize()
+            torch.cuda.synchronize()
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
@@ -1449,7 +1449,7 @@ class SGLangXPUConnector(GPUConnectorInterface):
             self.from_gpu(memory_obj, start, end, **kwargs)
 
 
-class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
+class SGLangLayerwiseKPUConnector(GPUConnectorInterface):
     """
     The GPU KV cache should be a list of tensors, one for each layer.
     More specifically, we have:
