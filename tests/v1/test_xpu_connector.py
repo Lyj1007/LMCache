@@ -12,11 +12,11 @@ import torch
 # First Party
 from lmcache import torch_device_type
 from lmcache.v1.gpu_connector.utils import get_dtype
-from lmcache.v1.gpu_connector.xpu_connectors import (
-    VLLMBufferLayerwiseXPUConnector,
-    VLLMPagedMemLayerwiseXPUConnector,
-    VLLMPagedMemXPUConnectorV2,
-    VLLMPagedMemXPUConnectorV3,
+from lmcache.v1.gpu_connector.kpu_connectors import (
+    VLLMBufferLayerwiseKPUConnector,
+    VLLMPagedMemLayerwiseKPUConnector,
+    VLLMPagedMemKPUConnectorV2,
+    VLLMPagedMemKPUConnectorV3,
 )
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
 from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
@@ -169,7 +169,7 @@ def test_vllm_paged_connector_v2_with_gpu_and_mla(use_gpu, engine_kv_format):
                 engine_kv_format,
             )
 
-    connector = VLLMPagedMemXPUConnectorV2(
+    connector = VLLMPagedMemKPUConnectorV2(
         hidden_dim,
         num_layers,
         use_gpu=use_gpu,
@@ -178,7 +178,7 @@ def test_vllm_paged_connector_v2_with_gpu_and_mla(use_gpu, engine_kv_format):
         device=torch_device_type,
         use_mla=use_mla,
     )
-    connector2 = VLLMPagedMemXPUConnectorV2(
+    connector2 = VLLMPagedMemKPUConnectorV2(
         hidden_dim,
         num_layers,
         use_gpu=use_gpu,
@@ -302,13 +302,13 @@ def test_vllm_paged_connector_v3_with_gpu_and_mla(
     metadata2 = _create_metadata(use_mla, dst_kv_caches, engine_kv_format)
 
     # connector will copy with src_kv_groups
-    connector = VLLMPagedMemXPUConnectorV3(
+    connector = VLLMPagedMemKPUConnectorV3(
         metadata=metadata,
         use_gpu=use_gpu,
         device=slot_mapping.device,
     )
     # connector2 will copy with dst_kv_groups
-    connector2 = VLLMPagedMemXPUConnectorV3(
+    connector2 = VLLMPagedMemKPUConnectorV3(
         metadata=metadata2,
         use_gpu=use_gpu,
         device=slot_mapping.device,
@@ -410,7 +410,7 @@ def test_layerwise_vllm_paged_connector_with_gpu(use_gpu, engine_kv_format):
             gpu_kv_src, gpu_kv_dst, slot_mapping, num_heads, head_size, engine_kv_format
         )
 
-    connector = VLLMPagedMemLayerwiseXPUConnector(
+    connector = VLLMPagedMemLayerwiseKPUConnector(
         hidden_dim,
         num_layers,
         use_gpu=use_gpu,
@@ -517,7 +517,7 @@ def test_batched_layerwise_vllm_paged_connector_with_gpu(use_gpu):
     with pytest.raises(AssertionError):
         check_paged_kv_cache_equal(gpu_kv_src, gpu_kv_dst, slot_mapping_total)
 
-    connector = VLLMPagedMemLayerwiseXPUConnector(
+    connector = VLLMPagedMemLayerwiseKPUConnector(
         hidden_dim,
         num_layers,
         use_gpu=use_gpu,
@@ -686,7 +686,7 @@ def test_layerwise_vllm_buffer_connector_with_gpu(use_gpu):
             gpu_kv_src, gpu_kv_dst, slot_mapping, num_heads, head_size
         )
 
-    connector = VLLMBufferLayerwiseXPUConnector(
+    connector = VLLMBufferLayerwiseKPUConnector(
         hidden_dim,
         num_layers,
         use_gpu=use_gpu,
@@ -757,10 +757,10 @@ def test_layerwise_vllm_buffer_connector_with_gpu(use_gpu):
 
 def test_vllm_paged_connector_v2_to_gpu_bench(benchmark):
     """
-    VLLMPagedMemXPUConnectorV2.to_gpu() micro-benchmark.
+    VLLMPagedMemKPUConnectorV2.to_gpu() micro-benchmark.
 
     This test is to measure the performance of
-    VLLMPagedMemXPUConnectorV2.to_gpu() when both KV caches and
+    VLLMPagedMemKPUConnectorV2.to_gpu() when both KV caches and
     memobject are on GPU.
 
     """
@@ -787,7 +787,7 @@ def test_vllm_paged_connector_v2_to_gpu_bench(benchmark):
         slot_mapping, device=torch_device_type, dtype=torch.int64
     )
 
-    connector = VLLMPagedMemXPUConnectorV2(hidden_dim, num_layers)
+    connector = VLLMPagedMemKPUConnectorV2(hidden_dim, num_layers)
     shape = connector.get_shape(chunk_size)
     memory_obj = allocator.allocate(shape, gpu_kv_src[0][0].dtype)
     connector.from_gpu(
