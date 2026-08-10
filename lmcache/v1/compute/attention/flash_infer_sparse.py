@@ -195,7 +195,7 @@ class LMCFlashInferSparseBackend(AttentionInterface):
         self.vllm_attn_impl: FlashInferImpl = vllm_attn.impl
 
         idx = torch_dev.current_device()
-        self.device = torch.device(f"{torch_device_type}:{idx}")
+        self.device = torch.device(f"{torch_dev.__name__.split('.')[-1]}:{idx}")
 
         self.workspace_buffer = torch.empty(
             self._WORKSPACE_BUFFER_SIZE_BYTES, dtype=torch.uint8, device=self.device

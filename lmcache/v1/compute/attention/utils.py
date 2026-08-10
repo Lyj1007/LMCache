@@ -85,7 +85,7 @@ def infer_attn_func_from_vllm(device_type):
     if device_type == "cuda":
         # Third Party
         from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata
-    elif device_type == "xpu":
+    elif device_type in ("xpu", "kpu"):
         # CUDA flash-attention extensions are unavailable on Intel XPU; use the
         # vLLM-shipped XPU flash-attention ops instead.
         # Third Party

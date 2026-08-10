@@ -50,7 +50,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self,
         config: LMCacheEngineConfig,
         metadata: Optional[LMCacheMetadata] = None,
-        dst_device: str = torch_device_type,
+        dst_device: str = torch_dev.__name__.split('.')[-1],
         lmcache_worker: Optional["LMCacheWorker"] = None,
         memory_allocator: Optional[MemoryAllocatorInterface] = None,
     ):

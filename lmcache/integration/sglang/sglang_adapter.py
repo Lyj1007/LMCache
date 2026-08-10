@@ -279,7 +279,7 @@ class LMCacheLayerwiseConnector(LMCacheConnector):
         retrieve_token_num = self.global_min_tokens(
             retrieve_token_num,
             self.tp_group,
-            torch.device(f"{torch_device_type}:{self.rank}"),
+            torch.device(f"{torch_dev.__name__.split('.')[-1]}:{self.rank}"),
         )
 
         # No new tokens to retrieve from LMCache
