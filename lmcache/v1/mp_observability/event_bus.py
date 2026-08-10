@@ -175,6 +175,12 @@ class EventBus:
         """
         if not self._config.enabled:
             return
+        # When no stream is available (e.g. shimmed accelerators such as
+        # Kunlun kpu where CuPy cannot be initialised), fall back to a plain
+        # publish rather than dereferencing a None stream.
+        if stream is None:
+            self.publish(event)
+            return
         if _has_native_recorder:
             str_metadata: dict[str, str] = {}
             int_metadata: dict[str, int] = {}
