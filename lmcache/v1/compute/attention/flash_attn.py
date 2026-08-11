@@ -42,7 +42,7 @@ class LMCFlashAttnBackend(AttentionInterface):
         self.aot_schedule = False
 
         idx = torch_dev.current_device()
-        self.device = torch.device(f"{torch_device_type}:{idx}")
+        self.device = torch.device(f"{torch_dev.__name__.split('.')[-1]}:{idx}")
         self.flash_attn_varlen_func, self.get_scheduler_metadata = (
             infer_attn_func_from_vllm(torch_device_type)
         )

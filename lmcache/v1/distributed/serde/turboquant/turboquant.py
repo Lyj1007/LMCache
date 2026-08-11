@@ -417,7 +417,7 @@ def _normalize_cuda_device(cuda_device: str) -> torch.device:
         ValueError: If the configured device is not a CUDA device.
     """
     if cuda_device.isdigit():
-        return torch.device(f"{torch_device_type}:{cuda_device}")
+        return torch.device(f"{torch_dev.__name__.split('.')[-1]}:{cuda_device}")
 
     device = torch.device(cuda_device)
     if device.type != torch_device_type:

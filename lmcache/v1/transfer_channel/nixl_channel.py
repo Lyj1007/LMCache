@@ -659,7 +659,7 @@ class NixlAgentWrapper:
         # The four fields are (base_addr, length, dev_id, meta_info)
         # https://github.com/ai-dynamo/nixl/blob/main/src/api/cpp/nixl_descriptors.h#L152
         memory_desc = [(buffer_ptr, buffer_size, tp_rank, "")]
-        _VRAM_DEVICE_TYPES = {"cuda", "xpu", "hpu"}
+        _VRAM_DEVICE_TYPES = {"cuda", "xpu", "hpu", "klx_xpu"}
 
         device_type = str(device).split(":")[0]
         if device_type == "cpu":

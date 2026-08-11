@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402
 """Centralized edits to vLLM kv cache specs.
 
 This is needed to mask out attention-specific details while making sure that
@@ -44,10 +45,52 @@ from typing import TypeAlias
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
-    KVCacheSpecKind,
-    get_kv_cache_spec_kind,
+    FullAttentionSpec,
+    SlidingWindowSpec,
+    ChunkedLocalAttentionSpec,
+    SinkFullAttentionSpec,
+    CrossAttentionSpec,
+    MambaSpec,
+    MLAAttentionSpec,
 )
 import torch
+
+# ---------------------------------------------------------------------------
+# Backwards-compatibility shim for vLLM >= 0.20.
+#
+# vLLM removed the ``KVCacheSpecKind`` enum and ``get_kv_cache_spec_kind``
+# helper (LMCache issue #3438): the KV cache spec is now expressed purely
+# through concrete spec classes (``FullAttentionSpec``, ``MambaSpec`` ...).
+# Re-map those classes back onto the enum so the rest of this module (and the
+# MP connector that imports it) keeps working without touching vLLM.
+# ---------------------------------------------------------------------------
+from enum import Enum
+
+
+class KVCacheSpecKind(Enum):
+    FULL_ATTENTION = "full_attention"
+    SLIDING_WINDOW = "sliding_window"
+    CHUNKED_LOCAL_ATTENTION = "chunked_local_attention"
+    SINK_FULL_ATTENTION = "sink_full_attention"
+    CROSS_ATTENTION = "cross_attention"
+    MAMBA = "mamba"
+    MLA_ATTENTION = "mla_attention"
+
+
+_SPEC_CLASS_TO_KIND = {
+    FullAttentionSpec: KVCacheSpecKind.FULL_ATTENTION,
+    SlidingWindowSpec: KVCacheSpecKind.SLIDING_WINDOW,
+    ChunkedLocalAttentionSpec: KVCacheSpecKind.CHUNKED_LOCAL_ATTENTION,
+    SinkFullAttentionSpec: KVCacheSpecKind.SINK_FULL_ATTENTION,
+    CrossAttentionSpec: KVCacheSpecKind.CROSS_ATTENTION,
+    MambaSpec: KVCacheSpecKind.MAMBA,
+    MLAAttentionSpec: KVCacheSpecKind.MLA_ATTENTION,
+}
+
+
+def get_kv_cache_spec_kind(spec: KVCacheSpec) -> KVCacheSpecKind:
+    """Return the :class:`KVCacheSpecKind` for a vLLM 0.20+ concrete spec."""
+    return _SPEC_CLASS_TO_KIND.get(type(spec), KVCacheSpecKind.FULL_ATTENTION)
 
 # First Party
 from lmcache.logging import init_logger

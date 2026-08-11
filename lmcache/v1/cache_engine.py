@@ -30,6 +30,7 @@ import torch
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
+
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_telemetry import InitializeUsageContext
 from lmcache.utils import (
@@ -66,6 +67,11 @@ from lmcache.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
+
+# Physical torch device type (e.g. "cuda" on Kunlun klx_xpu via xmlir). LMCache uses
+# a logical ``torch_device_type`` ("klx_xpu" on Kunlun), but torch.Tensor.to() only
+# accepts physical device types, so derive it from the active torch module.
+PHYS_DEVICE_TYPE = torch_dev.__name__.split(".")[-1]
 
 logger = init_logger(__name__)
 
@@ -1861,7 +1867,7 @@ class LMCacheEngine:
                 raw_tensor = memory_obj.raw_tensor
                 assert raw_tensor is not None
                 tensor_to_broadcast = raw_tensor.to(
-                    f"{torch_device_type}:{self.metadata.worker_id}"
+                    f"{PHYS_DEVICE_TYPE}:{self.metadata.worker_id}"
                 )
                 self.broadcast_fn(tensor_to_broadcast, self.metadata.first_rank)
 

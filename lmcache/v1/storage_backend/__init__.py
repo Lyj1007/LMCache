@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402
 # Standard
 from collections import OrderedDict
 from typing import TYPE_CHECKING, AbstractSet, Optional
@@ -6,8 +7,19 @@ import asyncio
 import importlib  # Added for dynamic import
 
 # First Party
-from lmcache import torch_dev, torch_device_type
+from lmcache import torch_dev
 from lmcache.logging import init_logger
+
+
+def _phys_device_type() -> str:
+    """Physical torch device type (e.g. 'cuda' on Kunlun klx_xpu via xmlir).
+
+    LMCache uses a logical ``torch_device_type`` (e.g. 'klx_xpu' for Kunlun), but
+    ``torch.device()`` only knows physical types. The actual torch module in
+    use (``torch_dev``) exposes the physical type via its module name, so we
+    derive it from there to stay correct on every platform.
+    """
+    return torch_dev.__name__.split('.')[-1]
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
@@ -112,13 +124,13 @@ def CreateStorageBackends(
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
     loop: asyncio.AbstractEventLoop,
-    dst_device: str = torch_device_type,
+    dst_device: str = _phys_device_type(),
     lmcache_worker: Optional["LMCacheWorker"] = None,
     skip_backends: Optional[AbstractSet[str]] = None,
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
     if is_cuda_worker(metadata):
-        dst_device = f"{torch_device_type}:{torch_dev.current_device()}"
+        dst_device = f"{_phys_device_type()}:{torch_dev.current_device()}"
     else:
         dst_device = "cpu"
     storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()

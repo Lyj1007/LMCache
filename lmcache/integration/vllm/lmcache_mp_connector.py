@@ -56,6 +56,31 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.utils import init_logger as lmcache_init_logger
 
+
+def _make_kv_event():
+    """Create an interprocess CUDA event for KV transfer ordering.
+
+    Returns ``None`` when the platform cannot provide an IPC-capable CUDA
+    event (e.g. Kunlun klx_xpu via xmlir surfaces as torch.cuda without a real
+    NVIDIA CUDA driver, and ``torch.Event(interprocess=True).record()`` raises
+    ``CUDA error: invalid argument``). The adapter and transfer context accept a
+    ``None`` event (the empty-request fallback already passes ``None``), so the
+    KV transfer still proceeds — only the event-ordered synchronisation hook is
+    skipped.
+    """
+    try:
+        event = torch_dev.Event(interprocess=True)
+        event.record()
+        return event
+    except Exception as exc:  # pragma: no cover - backend specific
+        logger.warning(
+            "Interprocess CUDA event unavailable (%s); proceeding without "
+            "event-ordered KV transfer synchronisation.",
+            exc,
+        )
+        return None
+
+
 try:
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
@@ -507,8 +532,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if len(request_ids) == 0:
             return
 
-        event = torch_dev.Event(interprocess=True)
-        event.record()
+        # Kunlun klx_xpu exposes the device via xmlir as torch.cuda, but its
+        # interprocess CUDA events are not supported (record() raises
+        # CUDA error: invalid argument). Degrade gracefully to None — the
+        # adapter and transfer context already accept a None event (see the
+        # empty-request fallback above).
+        event = _make_kv_event()
 
         self.worker_adapter.batched_submit_retrieve_requests(
             request_ids, ops, event, cache_salts=cache_salts
@@ -583,8 +612,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 dispatch(self.dispatcher, "wait_for_save", event=None)
             return
 
-        event = torch_dev.Event(interprocess=True)
-        event.record()
+        event = _make_kv_event()
 
         self.worker_adapter.batched_submit_store_requests(
             request_ids, ops, event, cache_salts=cache_salts

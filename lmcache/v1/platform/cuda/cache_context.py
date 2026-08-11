@@ -9,7 +9,7 @@ This module provides GPU-side KV cache management functionality, including:
 
 # Standard
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 import array
 
 # Third Party
@@ -17,7 +17,7 @@ import torch
 
 if TYPE_CHECKING:
     # Third Party
-    import cupy
+    import cupy  # noqa: F401
 
 # First Party
 from lmcache import torch_dev
@@ -419,19 +419,34 @@ class GPUCacheContext(BaseCacheContext):
             get_gds_context().register_gpu_buffer(self._temp_buffer.buffer)
 
         # Third Party
-        import cupy
+        # CuPy requires a real NVIDIA CUDA driver. On accelerators that expose
+        # the device through a compatibility shim (e.g. Kunlun klx_xpu via xmlir,
+        # which surfaces as torch.cuda without an NV driver) CuPy cannot be
+        # initialised. Degrade gracefully: a None cupy_stream simply means the
+        # CUDA-host-function based event hooks are unavailable; the event bus
+        # is a no-op when disabled, so the hot path is unaffected.
+        self.cupy_stream_: "Optional[Any]" = None
+        try:
+            import cupy
 
-        self.cupy_stream_: "cupy.cuda.Stream" = cupy.cuda.ExternalStream(
-            self.cuda_stream_.cuda_stream, self.device_.index
-        )
-
-        # Extra initialization
-        self.cupy_stream_.launch_host_func(
-            lambda logger: logger.info(
-                "Initialized cuda stream on device %s", str(self.device_)
-            ),
-            logger,
-        )
+            self.cupy_stream_ = cupy.cuda.ExternalStream(
+                self.cuda_stream_.cuda_stream, self.device_.index
+            )
+            # Extra initialization
+            self.cupy_stream_.launch_host_func(
+                lambda logger: logger.info(
+                    "Initialized cuda stream on device %s", str(self.device_)
+                ),
+                logger,
+            )
+        except Exception as exc:  # pragma: no cover - backend specific
+            logger.warning(
+                "CuPy stream unavailable on device %s (%s); continuing without "
+                "CUDA host-function event hooks.",
+                str(self.device_),
+                exc,
+            )
+            self.cupy_stream_ = None
 
     def close(self) -> None:
         """
@@ -448,7 +463,7 @@ class GPUCacheContext(BaseCacheContext):
         return self.cuda_stream_
 
     @property
-    def cupy_stream(self) -> "cupy.cuda.Stream":
+    def cupy_stream(self) -> "Optional[Any]":
         return self.cupy_stream_
 
     def get_kernel_group_kv_pointers(self, kernel_group_idx: int) -> torch.Tensor:
@@ -562,19 +577,29 @@ class PlainGPUCacheContext:
         # GPU streams
         self._cuda_stream = torch_dev.Stream(device=self._device)
         # Third Party
-        import cupy
+        # Graceful CuPy fallback (see GPUCacheContext for rationale): on
+        # shimmed accelerators (e.g. Kunlun klx_xpu) CuPy cannot be initialised.
+        self._cupy_stream: "Optional[Any]" = None
+        try:
+            import cupy
 
-        self._cupy_stream: "cupy.cuda.Stream" = cupy.cuda.ExternalStream(
-            self._cuda_stream.cuda_stream, self._device.index
-        )
-
-        # Extra initialization
-        self._cupy_stream.launch_host_func(
-            lambda logger: logger.info(
-                "Initialized cuda stream on device %s", str(self._device)
-            ),
-            logger,
-        )
+            self._cupy_stream = cupy.cuda.ExternalStream(
+                self._cuda_stream.cuda_stream, self._device.index
+            )
+            self._cupy_stream.launch_host_func(
+                lambda logger: logger.info(
+                    "Initialized cuda stream on device %s", str(self._device)
+                ),
+                logger,
+            )
+        except Exception as exc:  # pragma: no cover - backend specific
+            logger.warning(
+                "CuPy stream unavailable on device %s (%s); continuing without "
+                "CUDA host-function event hooks.",
+                str(self._device),
+                exc,
+            )
+            self._cupy_stream = None
 
     def get_kv_buffer_shape(self, num_tokens: int) -> torch.Size:
         """
@@ -608,7 +633,7 @@ class PlainGPUCacheContext:
         return self._cuda_stream
 
     @property
-    def cupy_stream(self) -> "cupy.cuda.Stream":
+    def cupy_stream(self) -> "Optional[Any]":
         return self._cupy_stream
 
     @property
