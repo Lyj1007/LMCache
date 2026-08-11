@@ -15,8 +15,16 @@ from lmcache.v1.metadata import LMCacheMetadata
 # subset of accelerators. Each entry is ``(attr_name, human_label,
 # supported_devices)``; the human label is what appears in the error message.
 _DEVICE_SCOPED_VLLM_BOOL_FEATURES: tuple[tuple[str, str, frozenset[str]], ...] = (
-    ("enable_blending", "config.enable_blending", frozenset({"cuda", "xpu"})),
-    ("use_gpu_connector_v3", "config.use_gpu_connector_v3", frozenset({"cuda", "xpu"})),
+    (
+        "enable_blending",
+        "config.enable_blending",
+        frozenset({"cuda", "xpu", "klx_xpu"}),
+    ),
+    (
+        "use_gpu_connector_v3",
+        "config.use_gpu_connector_v3",
+        frozenset({"cuda", "xpu", "klx_xpu"}),
+    ),
 )
 
 
@@ -87,18 +95,19 @@ def CreateGPUConnector(
         hidden_dim_size = num_kv_head * head_dim
         local_worker_id = metadata.local_worker_id
         torch_dev.set_device(local_worker_id)
-        device = torch.device(f"{torch_device_type}:{local_worker_id}")
+        _pd = torch_dev.__name__.split('.')[-1]
+        device = torch.device(f"{_pd}:{local_worker_id}")
         kv_dtype = metadata.kv_dtype
 
-        if torch_device_type == "xpu":
+        if torch_device_type in ("xpu", "klx_xpu"):
             # First Party
-            from lmcache.v1.gpu_connector.xpu_connectors import (
-                SGLangLayerwiseXPUConnector,
-                SGLangXPUConnector,
+            from lmcache.v1.gpu_connector.klx_xpu_connectors import (
+                SGLangLayerwiseKLX_XPUConnector,
+                SGLangKLX_XPUConnector,
             )
 
             if config.use_layerwise:
-                return SGLangLayerwiseXPUConnector(
+                return SGLangLayerwiseKLX_XPUConnector(
                     hidden_dim_size,
                     num_layer,
                     use_gpu=use_gpu,
@@ -107,7 +116,7 @@ def CreateGPUConnector(
                     device=device,
                 )
             else:
-                return SGLangXPUConnector(
+                return SGLangKLX_XPUConnector(
                     hidden_dim_size,
                     num_layer,
                     use_gpu=use_gpu,
@@ -153,7 +162,8 @@ def CreateGPUConnector(
 
         local_worker_id = metadata.local_worker_id
         torch_dev.set_device(local_worker_id)
-        device = torch.device(f"{torch_device_type}:{local_worker_id}")
+        _pd = torch_dev.__name__.split('.')[-1]
+        device = torch.device(f"{_pd}:{local_worker_id}")
 
         if torch_device_type == "cuda":
             # First Party
@@ -182,31 +192,31 @@ def CreateGPUConnector(
                 return VLLMPagedMemGPUConnectorV2.from_metadata(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
-        elif torch_device_type == "xpu":
+        elif torch_device_type in ("xpu", "klx_xpu"):
             # First Party
-            from lmcache.v1.gpu_connector.xpu_connectors import (
-                VLLMBufferLayerwiseXPUConnector,
-                VLLMPagedMemLayerwiseXPUConnector,
-                VLLMPagedMemXPUConnectorV2,
-                VLLMPagedMemXPUConnectorV3,
+            from lmcache.v1.gpu_connector.klx_xpu_connectors import (
+                VLLMBufferLayerwiseKLX_XPUConnector,
+                VLLMPagedMemLayerwiseKLX_XPUConnector,
+                VLLMPagedMemKLX_XPUConnectorV2,
+                VLLMPagedMemKLX_XPUConnectorV3,
             )
 
             if config.use_layerwise:
                 if config.enable_blending:
-                    return VLLMBufferLayerwiseXPUConnector.from_metadata(
+                    return VLLMBufferLayerwiseKLX_XPUConnector.from_metadata(
                         metadata, use_gpu, device
                     )
                 else:
-                    return VLLMPagedMemLayerwiseXPUConnector.from_metadata(
+                    return VLLMPagedMemLayerwiseKLX_XPUConnector.from_metadata(
                         metadata, use_gpu, device
                     )
 
             if config.use_gpu_connector_v3:
-                return VLLMPagedMemXPUConnectorV3.from_metadata(
+                return VLLMPagedMemKLX_XPUConnectorV3.from_metadata(
                     metadata, use_gpu, device
                 )
             else:
-                return VLLMPagedMemXPUConnectorV2.from_metadata(
+                return VLLMPagedMemKLX_XPUConnectorV2.from_metadata(
                     metadata, use_gpu, device
                 )
         elif torch_device_type == "musa":
@@ -237,7 +247,8 @@ def CreateGPUConnector(
 
         local_worker_id = metadata.local_worker_id
         torch_dev.set_device(local_worker_id)
-        device = torch.device(f"{torch_device_type}:{local_worker_id}")
+        _pd = torch_dev.__name__.split('.')[-1]
+        device = torch.device(f"{_pd}:{local_worker_id}")
         return TRTLLMGPUConnector.from_metadata(metadata, device=device)
 
     elif engine == EngineType.MOCK:
