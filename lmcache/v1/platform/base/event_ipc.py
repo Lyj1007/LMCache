@@ -22,6 +22,12 @@ import inspect
 # First Party
 from lmcache import torch_dev, torch_device_type
 
+# ``_device_detect`` is deliberately import-cycle free (same reason
+# ``torch_ops`` imports it at module top level): it never touches
+# ``platform/__init__``, so pulling it in here is safe even when platform
+# subclass discovery imports this module mid-initialization.
+from lmcache.v1.platform._device_detect import normalize_device_type
+
 
 def _accepts_interprocess(event_cls: object) -> bool:
     """Return whether ``event_cls`` accepts an ``interprocess`` parameter."""
@@ -49,18 +55,26 @@ def _resolve_device_type(device: object) -> str:
             string, or an integer device index.
 
     Returns:
-        The device-type string. Integer indices use the active
-        ``torch_device_type`` for backend selection; the original integer is
-        still passed unchanged to backend operations by the caller.
+        The device-type string, normalized onto the LMCache logical device
+        type. Integer indices use the active ``torch_device_type`` for backend
+        selection; the original integer is still passed unchanged to backend
+        operations by the caller.
+
+    Note:
+        Normalization is what keeps shim-based accelerators correct here: a
+        Kunlun KLX_XPU tensor reports ``device.type == "cuda"``, and binding the
+        CUDA event backend would hand back interprocess event handles the
+        hardware cannot produce.
     """
     if isinstance(device, int):
         return torch_device_type
     device_type = getattr(device, "type", None)
-    if isinstance(device_type, str):
-        return device_type
-    if isinstance(device, str):
-        return device.split(":", maxsplit=1)[0]
-    return str(device)
+    if not isinstance(device_type, str):
+        if isinstance(device, str):
+            device_type = device.split(":", maxsplit=1)[0]
+        else:
+            device_type = str(device)
+    return normalize_device_type(device_type)
 
 
 @runtime_checkable

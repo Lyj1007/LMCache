@@ -30,6 +30,38 @@ logger = init_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Kunlun KLX_XPU detection
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def is_kunlun_klx_xpu() -> bool:
+    """Detect whether the current environment is Kunlun KLX_XPU with xmlir.
+
+    On Kunlun KLX_XPU, ``torch_xmlir`` is loaded and provides CUDA API
+    compatibility, so ``torch.cuda.is_available()`` reports True even though
+    the underlying hardware is Kunlun.  The KLX_XPU offload path uses this flag to
+    win device auto-detection ahead of the generic CUDA spec and to pick the
+    engine-driven transfer context.
+
+    Kept in this low-level module (rather than ``lmcache.__init__``) so that
+    :meth:`DeviceSpec.is_available` implementations and the multiprocess
+    transfer router can share it without importing ``lmcache.__init__`` and
+    triggering the platform import cycle.
+
+    Returns:
+        True when ``torch_xmlir`` can be imported, False otherwise.
+    """
+    try:
+        # Third Party
+        import torch_xmlir  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
@@ -100,6 +132,17 @@ def _detect_device() -> tuple[Any, str]:
                 env_device_type,
             )
 
+    # Kunlun KLX_XPU exposes torch.cuda via xmlir, so CudaDeviceSpec.is_available()
+    # would otherwise win the generic (alphabetical) scan below and bind the
+    # CUDA native .so that cannot run on Kunlun hardware. Give the KLX_XPU spec
+    # priority so KlxXpuDeviceOps (THP hugepages + xmlir memcpy) is selected.
+    if is_kunlun_klx_xpu():
+        klx_xpu_spec = registry.get("klx_xpu")
+        if klx_xpu_spec is not None and klx_xpu_spec.is_available():
+            torch_module = getattr(torch, klx_xpu_spec.torch_module_name, None)
+            if torch_module is not None:
+                return torch_module, klx_xpu_spec.device_type
+
     for spec in registry.values():
         if not spec.is_available():
             continue
@@ -165,3 +208,35 @@ def current_device_spec() -> "DeviceSpec":
             )
         return DeviceSpec()
     return spec
+
+
+def normalize_device_type(device_type: str) -> str:
+    """Map a torch-reported device type onto the LMCache logical device type.
+
+    Some accelerators drive PyTorch through a compatibility shim that reuses
+    another backend's torch module.  Kunlun KLX_XPU runs on ``torch_xmlir``, so its
+    tensors report ``device.type == "cuda"`` even though CUDA IPC handles, CUDA
+    events and the CUDA native ops are all unusable there.  Resolving such a
+    tensor by its raw string would silently bind the *CUDA* spec and hand back
+    a wrapper / event backend the hardware cannot honour.
+
+    The rule is capability-driven rather than device-specific: when the running
+    accelerator borrows *device_type* as its ``torch_module_name`` while
+    registering a different ``device_type`` of its own, the borrowed name
+    belongs to that accelerator.  Backends whose module name matches their own
+    device type (CUDA, MUSA, XPU, ...) are returned unchanged, so this is a
+    no-op on every conventional platform and new shim-based backends are
+    picked up with zero edits here.
+
+    Args:
+        device_type: Device type as reported by torch (e.g. ``tensor.device.type``).
+
+    Returns:
+        The LMCache logical device type to use for registry lookups.
+    """
+    if not device_type:
+        return device_type
+    spec = current_device_spec()
+    if spec.device_type != device_type and spec.torch_module_name == device_type:
+        return spec.device_type
+    return device_type

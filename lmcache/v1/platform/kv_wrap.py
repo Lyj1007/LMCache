@@ -21,6 +21,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.custom_types import KVCache
 from lmcache.v1.platform import resolve_kv_wrapper_factory
+from lmcache.v1.platform._device_detect import normalize_device_type
 
 logger = init_logger(__name__)
 
@@ -32,8 +33,13 @@ def wrap_one_kv_cache(tensor: torch.Tensor) -> Any:
     subclasses under ``lmcache.v1.platform``, so this call site stays
     free of if/elif chains and new accelerators plug in by shipping a
     sibling wrapper class.
+
+    The device type is normalized first: shim accelerators such as Kunlun
+    KLX_XPU report ``device.type == "cuda"`` while registering a distinct
+    logical device type, so binding the raw string would select the CUDA
+    IPC wrapper instead of the shim's own.
     """
-    return resolve_kv_wrapper_factory(tensor.device.type)(tensor)
+    return resolve_kv_wrapper_factory(normalize_device_type(tensor.device.type))(tensor)
 
 
 def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
