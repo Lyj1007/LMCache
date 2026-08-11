@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # tests/v1/test_xpu_sglang_connector.py
 #
-# Unit tests for SGLang XPU connectors (SGLangXPUConnector and
-# SGLangLayerwiseXPUConnector). Mirrors the structure of
+# Unit tests for SGLang XPU connectors (SGLangKLX_XPUConnector and
+# SGLangLayerwiseKLX_XPUConnector). Mirrors the structure of
 # test_xpu_connector.py which covers the vLLM XPU connectors.
 
 # Third Party
@@ -11,10 +11,10 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.v1.gpu_connector import xpu_connectors
-from lmcache.v1.gpu_connector.xpu_connectors import (
-    SGLangLayerwiseXPUConnector,
-    SGLangXPUConnector,
+from lmcache.v1.gpu_connector import klx_xpu_connectors
+from lmcache.v1.gpu_connector.klx_xpu_connectors import (
+    SGLangLayerwiseKLX_XPUConnector,
+    SGLangKLX_XPUConnector,
 )
 from lmcache.v1.memory_allocators.pin_memory_allocator import PinMemoryAllocator
 from lmcache.v1.memory_management import MemoryFormat
@@ -92,7 +92,7 @@ def _flat_to_nested_sglang_mha(kvcaches_flat, num_layers: int):
 
 
 # --------------------------------------------------------------------------- #
-# Non-layerwise (SGLangXPUConnector)
+# Non-layerwise (SGLangKLX_XPUConnector)
 # --------------------------------------------------------------------------- #
 
 
@@ -125,7 +125,7 @@ def test_sglang_xpu_connector_roundtrip(use_xpu: bool, use_mla: bool):
         total_slots=total_slots, num_tokens=num_tokens, device=device
     )
 
-    conn = SGLangXPUConnector(
+    conn = SGLangKLX_XPUConnector(
         hidden_dim_size=hidden_dim,
         num_layers=num_layers,
         use_xpu=use_xpu,
@@ -217,7 +217,7 @@ def test_sglang_xpu_connector_roundtrip_multi_chunk(use_xpu: bool, use_mla: bool
     )
     packed_slot_mapping = _pack_slot_mapping(slot_mapping, starts, ends)
 
-    conn = SGLangXPUConnector(
+    conn = SGLangKLX_XPUConnector(
         hidden_dim_size=hidden_dim,
         num_layers=num_layers,
         use_xpu=use_xpu,
@@ -307,7 +307,7 @@ def test_sglang_xpu_connector_roundtrip_flat_mha_kvcaches(use_xpu: bool):
         total_slots=total_slots, num_tokens=num_tokens, device=device
     )
 
-    conn = SGLangXPUConnector(
+    conn = SGLangKLX_XPUConnector(
         hidden_dim_size=hidden_dim,
         num_layers=num_layers,
         use_xpu=use_xpu,
@@ -366,7 +366,7 @@ def test_sglang_xpu_connector_roundtrip_flat_mha_kvcaches(use_xpu: bool):
 
 
 # --------------------------------------------------------------------------- #
-# Layerwise (SGLangLayerwiseXPUConnector)
+# Layerwise (SGLangLayerwiseKLX_XPUConnector)
 # --------------------------------------------------------------------------- #
 
 
@@ -399,7 +399,7 @@ def test_sglang_xpu_connector_roundtrip_layerwise(use_xpu: bool, use_mla: bool):
         total_slots=total_slots, num_tokens=num_tokens, device=device
     )
 
-    conn = SGLangLayerwiseXPUConnector(
+    conn = SGLangLayerwiseKLX_XPUConnector(
         hidden_dim_size=hidden_dim,
         num_layers=num_layers,
         use_xpu=use_xpu,
@@ -513,7 +513,7 @@ def test_sglang_xpu_connector_roundtrip_layerwise_multi_chunk(
     )
     packed_slot_mapping = _pack_slot_mapping(slot_mapping, starts, ends)
 
-    conn = SGLangLayerwiseXPUConnector(
+    conn = SGLangLayerwiseKLX_XPUConnector(
         hidden_dim_size=hidden_dim,
         num_layers=num_layers,
         use_xpu=use_xpu,
@@ -622,7 +622,7 @@ def test_sglang_layerwise_uses_kernel_transfers(monkeypatch):
         device=device,
     )
 
-    conn = SGLangLayerwiseXPUConnector(
+    conn = SGLangLayerwiseKLX_XPUConnector(
         hidden_dim_size=hidden_dim,
         num_layers=num_layers,
         use_xpu=True,
@@ -649,7 +649,7 @@ def test_sglang_layerwise_uses_kernel_transfers(monkeypatch):
 
     calls: list[tuple[object, bool]] = []
     orig_single_layer_kv_transfer_sgl = (
-        xpu_connectors.lmc_ops.single_layer_kv_transfer_sgl
+        klx_xpu_connectors.lmc_ops.single_layer_kv_transfer_sgl
     )
 
     def _recording_single_layer_kv_transfer_sgl(
@@ -671,7 +671,7 @@ def test_sglang_layerwise_uses_kernel_transfers(monkeypatch):
         )
 
     monkeypatch.setattr(
-        xpu_connectors.lmc_ops,
+        klx_xpu_connectors.lmc_ops,
         "single_layer_kv_transfer_sgl",
         _recording_single_layer_kv_transfer_sgl,
     )
@@ -715,10 +715,10 @@ def test_sglang_layerwise_uses_kernel_transfers(monkeypatch):
 
         expected_calls_per_direction = num_layers * num_chunks
         d2h_calls = [
-            c for c in calls if c[0] == xpu_connectors.lmc_ops.TransferDirection.D2H
+            c for c in calls if c[0] == klx_xpu_connectors.lmc_ops.TransferDirection.D2H
         ]
         h2d_calls = [
-            c for c in calls if c[0] == xpu_connectors.lmc_ops.TransferDirection.H2D
+            c for c in calls if c[0] == klx_xpu_connectors.lmc_ops.TransferDirection.H2D
         ]
 
         assert len(d2h_calls) == expected_calls_per_direction
@@ -762,7 +762,7 @@ def test_sglang_layerwise_uses_mla_kernel_transfers(monkeypatch):
         device=device,
     )
 
-    conn = SGLangLayerwiseXPUConnector(
+    conn = SGLangLayerwiseKLX_XPUConnector(
         hidden_dim_size=hidden_dim,
         num_layers=num_layers,
         use_xpu=True,
@@ -789,9 +789,9 @@ def test_sglang_layerwise_uses_mla_kernel_transfers(monkeypatch):
 
     single_layer_calls: list[tuple[object, bool]] = []
     sgl_calls: list[tuple[object, bool]] = []
-    orig_single_layer_kv_transfer = xpu_connectors.lmc_ops.single_layer_kv_transfer
+    orig_single_layer_kv_transfer = klx_xpu_connectors.lmc_ops.single_layer_kv_transfer
     orig_single_layer_kv_transfer_sgl = (
-        xpu_connectors.lmc_ops.single_layer_kv_transfer_sgl
+        klx_xpu_connectors.lmc_ops.single_layer_kv_transfer_sgl
     )
 
     def _recording_single_layer_kv_transfer(
@@ -831,12 +831,12 @@ def test_sglang_layerwise_uses_mla_kernel_transfers(monkeypatch):
         )
 
     monkeypatch.setattr(
-        xpu_connectors.lmc_ops,
+        klx_xpu_connectors.lmc_ops,
         "single_layer_kv_transfer",
         _recording_single_layer_kv_transfer,
     )
     monkeypatch.setattr(
-        xpu_connectors.lmc_ops,
+        klx_xpu_connectors.lmc_ops,
         "single_layer_kv_transfer_sgl",
         _recording_single_layer_kv_transfer_sgl,
     )
@@ -882,12 +882,12 @@ def test_sglang_layerwise_uses_mla_kernel_transfers(monkeypatch):
         d2h_calls = [
             c
             for c in single_layer_calls
-            if c[0] == xpu_connectors.lmc_ops.TransferDirection.D2H
+            if c[0] == klx_xpu_connectors.lmc_ops.TransferDirection.D2H
         ]
         h2d_calls = [
             c
             for c in single_layer_calls
-            if c[0] == xpu_connectors.lmc_ops.TransferDirection.H2D
+            if c[0] == klx_xpu_connectors.lmc_ops.TransferDirection.H2D
         ]
 
         assert len(d2h_calls) == expected_calls_per_direction

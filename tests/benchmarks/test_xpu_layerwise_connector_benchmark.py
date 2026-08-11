@@ -15,7 +15,9 @@ from lmcache import torch_dev, torch_device_type
 from lmcache.utils import mock_up_broadcast_fn, mock_up_broadcast_object_fn
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.gpu_connector.xpu_connectors import VLLMPagedMemLayerwiseXPUConnector
+from lmcache.v1.gpu_connector.klx_xpu_connectors import (
+    VLLMPagedMemLayerwiseKLX_XPUConnector,
+)
 from tests.v1.utils import (
     dumb_metadata,
     generate_kv_cache_paged_list_tensors,
@@ -74,7 +76,7 @@ def _create_connector(
     dtype: torch.dtype,
     use_mla: bool = False,
 ):
-    return VLLMPagedMemLayerwiseXPUConnector(
+    return VLLMPagedMemLayerwiseKLX_XPUConnector(
         hidden_dim,
         num_layers,
         use_gpu=use_gpu,

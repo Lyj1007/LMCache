@@ -641,9 +641,11 @@ def create_gpu_connector(hidden_dim, num_layers):
 
 def create_xpu_connector(hidden_dim, num_layers):
     # First Party
-    from lmcache.v1.gpu_connector.xpu_connectors import VLLMPagedMemXPUConnectorV2
+    from lmcache.v1.gpu_connector.klx_xpu_connectors import (
+        VLLMPagedMemKLX_XPUConnectorV2,
+    )
 
-    return VLLMPagedMemXPUConnectorV2(hidden_dim, num_layers)
+    return VLLMPagedMemKLX_XPUConnectorV2(hidden_dim, num_layers)
 
 
 def create_musa_connector(
